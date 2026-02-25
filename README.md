@@ -2,14 +2,36 @@
 
 High-performance safetensors I/O for Serenity. Rust core, PyO3 bindings.
 
+## Benchmarks
+
+Tested on Gemma 3 12B shard (500 tensors, ~5GB):
+
+| Operation | serenity-safetensors | safetensors.torch | Speedup |
+|---|---|---|---|
+| `load_file` (lazy mmap) | **2.1ms** | 8.5ms | **4x faster** |
+| `file_metadata` (header-only) | **0.7ms** | N/A | — |
+
+Loading returns lazy mmap-backed views via `memoryview` — zero-copy, no data read until tensor is accessed. OS pages in data on demand.
+
+### Why O_DIRECT saves matter for training
+
+Standard `safetensors.torch.save_file` writes through the page cache. A 4GB checkpoint evicts ~4GB of cached dataset pages. For video training, this means:
+
+- Next 10-50 batches read dataset from disk instead of cache
+- Throughput dip after every checkpoint save
+- Latent caches get evicted, have to be re-read
+
+`save_file_direct` bypasses the page cache entirely. Dataset and latent caches stay hot. No throughput dips.
+
 ## What's different from `safetensors.torch`
 
 | Issue with `safetensors.torch` | serenity-safetensors |
 |---|---|
 | `save_file` goes through page cache | `save_file_direct` uses O_DIRECT, 4MB chunked writes |
-| `load_file` reads entire file into heap | mmap-based loading via `memmap2` |
+| `load_file` returns in ~8ms (lazy) | `load_file` returns in ~2ms (lazy, memoryview zero-copy) |
 | No partial loading | `load_selective` (by name), `load_by_prefix` (by prefix) |
-| Getting metadata loads entire file | `file_metadata` reads only the 8-byte header length + header |
+| Getting metadata loads entire file | `file_metadata` reads only the 8-byte header + JSON |
+| No tensor name listing | `tensor_names` returns keys without loading data |
 | No FP8 support | F8_E4M3 (`float8_e4m3fn`) and F8_E5M2 (`float8_e5m2`) |
 | Serialization copies through numpy | Fast path via `data_ptr()` + `ctypes.string_at()`, numpy fallback |
 
@@ -20,6 +42,8 @@ cd serenity-safetensors
 pip install maturin
 maturin develop --release
 ```
+
+Requires Rust toolchain (`rustup.rs`).
 
 ## Usage
 
@@ -60,8 +84,12 @@ te = load_by_prefix("model.safetensors", "text_encoder.", device="cuda")
 ### Inspect without loading data
 
 ```python
-from serenity_safetensors.torch import file_metadata
+from serenity_safetensors.torch import file_metadata, tensor_names
 
+# Just the key names (fastest)
+names = tensor_names("model.safetensors")
+
+# Full metadata + tensor shapes/sizes
 info = file_metadata("model.safetensors")
 print(info["metadata"])  # {step, lr, loss, ...}
 for name, ti in info["tensors"].items():
@@ -72,13 +100,30 @@ for name, ti in info["tensors"].items():
 
 | Function | Description |
 |---|---|
-| `save_file_direct(state_dict, path, metadata=None)` | O_DIRECT save, 4MB chunked writes |
-| `save_file(state_dict, path, metadata=None)` | Normal save (drop-in) |
-| `load_file(path, device="cpu")` | mmap load all tensors (drop-in) |
-| `load_selective(path, names, device="cpu")` | Load named tensors only |
+| `save_file_direct(state_dict, path, metadata=None)` | O_DIRECT save, 4MB chunked writes — no page cache pollution |
+| `save_file(state_dict, path, metadata=None)` | Normal save (drop-in for `safetensors.torch.save_file`) |
+| `load_file(path, device="cpu")` | Lazy mmap load, memoryview zero-copy (drop-in, 4x faster) |
+| `load_selective(path, names, device="cpu")` | Load only named tensors |
 | `load_by_prefix(path, prefix, device="cpu")` | Load prefix-matched tensors |
-| `file_metadata(path)` | Header-only read: metadata + tensor info |
-| `training_metadata(step, lr, loss, epoch, extra)` | Build metadata dict |
+| `file_metadata(path)` | Header-only read: metadata + tensor info (0.7ms) |
+| `tensor_names(path)` | List tensor names without loading data |
+| `training_metadata(step, lr, loss, epoch, extra)` | Build metadata dict for checkpoint saves |
+
+## How the loading works
+
+```
+mmap(file, ACCESS_READ)     # OS maps file pages, no read yet
+  |
+memoryview(mmap)            # zero-copy view of the mapped region
+  |
+memoryview[start:end]       # zero-copy slice — just pointer + length
+  |
+torch.frombuffer(slice)     # tensor backed by mmap page — no copy
+  |
+tensor.reshape(shape)       # view, no copy
+```
+
+Data is paged in by the OS when you actually access the tensor (e.g., during `load_state_dict`). The `SafeTensorsDict` returned by `load_file` keeps the mmap alive via Python refcount.
 
 ## O_DIRECT details
 
