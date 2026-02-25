@@ -1,7 +1,7 @@
 use pyo3::exceptions::{PyIOError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
-use safetensors::tensor::{Dtype as StDtype, SafeTensors, TensorView};
+use pyo3::types::{PyDict, PySlice, PyTuple};
+use safetensors::tensor::{Dtype as StDtype, TensorView};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -32,25 +32,6 @@ impl From<SsError> for PyErr {
 }
 
 // ── Dtype conversion ─────────────────────────────────────────────────────────
-// FIX #4: Added F8_E4M3 and F8_E5M2 for FP8 support
-
-fn torch_dtype_str(dtype: StDtype) -> &'static str {
-    match dtype {
-        StDtype::F64 => "float64",
-        StDtype::F32 => "float32",
-        StDtype::F16 => "float16",
-        StDtype::BF16 => "bfloat16",
-        StDtype::F8_E4M3 => "float8_e4m3fn",
-        StDtype::F8_E5M2 => "float8_e5m2",
-        StDtype::I64 => "int64",
-        StDtype::I32 => "int32",
-        StDtype::I16 => "int16",
-        StDtype::I8 => "int8",
-        StDtype::U8 => "uint8",
-        StDtype::BOOL => "bool",
-        _ => "float32",
-    }
-}
 
 fn dtype_from_torch_str(s: &str) -> Result<StDtype, SsError> {
     match s {
@@ -80,48 +61,27 @@ fn dtype_element_size(dtype: StDtype) -> usize {
     }
 }
 
-// ── Mmap-based file loading ──────────────────────────────────────────────────
-// FIX #1: Use mmap instead of fs::read for loading. No heap copy of multi-GB files.
-
-/// Memory-map a safetensors file. Returns the mmap and parsed SafeTensors.
-/// The mmap stays alive as long as the caller holds it — tensors reference
-/// directly into the mapped pages. OS handles paging, no userspace copy.
-fn mmap_safetensors(path: &str) -> Result<memmap2::Mmap, SsError> {
-    let file = fs::File::open(path)?;
-    // SAFETY: We don't modify the file while mapped. The file is opened read-only.
-    // If the file is modified externally while mapped, that's UB, but that's
-    // the caller's problem (same as safetensors' own mmap loading).
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    Ok(mmap)
-}
-
-// ── Header-only read ─────────────────────────────────────────────────────────
-// FIX #5: Read only the 8-byte length prefix + header bytes, not the entire file.
+// ── Header-only file read ───────────────────────────────────────────────────
 
 fn read_header(path: &str) -> Result<(HashMap<String, String>, serde_json::Value), SsError> {
     use std::io::Read;
-
     let mut file = fs::File::open(path)?;
 
-    // Read 8-byte header length
     let mut len_buf = [0u8; 8];
     file.read_exact(&mut len_buf)?;
     let header_len = u64::from_le_bytes(len_buf) as usize;
 
-    // Sanity check: header shouldn't be > 100MB
     if header_len > 100 * 1024 * 1024 {
         return Err(SsError::Other(format!(
             "Header length {header_len} seems unreasonable"
         )));
     }
 
-    // Read just the header
     let mut header_buf = vec![0u8; header_len];
     file.read_exact(&mut header_buf)?;
 
     let header: serde_json::Value = serde_json::from_slice(&header_buf)?;
 
-    // Extract user metadata
     let mut metadata = HashMap::new();
     if let Some(md) = header.get("__metadata__") {
         if let Some(obj) = md.as_object() {
@@ -132,12 +92,10 @@ fn read_header(path: &str) -> Result<(HashMap<String, String>, serde_json::Value
             }
         }
     }
-
     Ok((metadata, header))
 }
 
-// ── O_DIRECT chunked write ───────────────────────────────────────────────────
-// FIX #3: Chunked writes (4MB at a time) instead of single blocking write.
+// ── O_DIRECT chunked write ──────────────────────────────────────────────────
 
 #[cfg(unix)]
 fn write_direct(path: &Path, data: &[u8]) -> Result<(), SsError> {
@@ -153,15 +111,13 @@ fn write_direct(path: &Path, data: &[u8]) -> Result<(), SsError> {
     };
 
     if fd < 0 {
-        // O_DIRECT not supported (tmpfs, NFS, etc.) — fall back to normal write
         fs::write(path, data)?;
         return Ok(());
     }
 
     const ALIGN: usize = 4096;
-    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
-    // Allocate one aligned buffer, reuse for all chunks
     let alloc_size = (CHUNK_SIZE + ALIGN - 1) & !(ALIGN - 1);
     let layout = std::alloc::Layout::from_size_align(alloc_size, ALIGN)
         .map_err(|e| SsError::Other(e.to_string()))?;
@@ -177,12 +133,9 @@ fn write_direct(path: &Path, data: &[u8]) -> Result<(), SsError> {
         while offset < data.len() {
             let remaining = data.len() - offset;
             let this_chunk = remaining.min(CHUNK_SIZE);
-            // Pad to alignment for O_DIRECT
             let write_len = (this_chunk + ALIGN - 1) & !(ALIGN - 1);
 
-            // Zero the buffer (important for padding bytes)
             std::ptr::write_bytes(buf, 0, alloc_size);
-            // Copy this chunk
             std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), buf, this_chunk);
 
             let written = libc::write(fd, buf as *const libc::c_void, write_len);
@@ -196,7 +149,6 @@ fn write_direct(path: &Path, data: &[u8]) -> Result<(), SsError> {
             offset += this_chunk;
         }
 
-        // Truncate to exact size (last chunk may have been padded)
         libc::ftruncate(fd, data.len() as libc::off_t);
         libc::close(fd);
         std::alloc::dealloc(buf, layout);
@@ -211,9 +163,7 @@ fn write_direct(path: &Path, data: &[u8]) -> Result<(), SsError> {
     Ok(())
 }
 
-// ── Serialize state_dict ─────────────────────────────────────────────────────
-// FIX #2: Use buffer protocol via ctypes to get raw pointer instead of numpy roundtrip.
-// Falls back to numpy if ctypes approach fails (e.g., non-contiguous tensor).
+// ── Serialize state_dict ────────────────────────────────────────────────────
 
 struct TensorData {
     name: String,
@@ -253,24 +203,18 @@ fn serialize_state_dict(
             .and_then(|s| s.extract())
             .map_err(|e| SsError::Other(format!("Cannot get shape for {name}: {e}")))?;
 
-        // Ensure contiguous CPU tensor
         let cpu_tensor = value
             .call_method0("detach")
             .and_then(|t| t.call_method0("cpu"))
             .and_then(|t| t.call_method0("contiguous"))
             .map_err(|e| SsError::Other(format!("Cannot prepare tensor {name}: {e}")))?;
 
-        // Calculate expected byte count
         let numel: usize = shape.iter().product();
         let nbytes = numel * dtype_element_size(st_dtype);
 
-        // Try fast path: data_ptr() via untyped_storage to avoid copy
         let data = match extract_tensor_bytes_fast(py, &cpu_tensor, nbytes) {
             Ok(d) => d,
-            Err(_) => {
-                // Fallback: numpy roundtrip (handles edge cases)
-                extract_tensor_bytes_numpy(py, &cpu_tensor, &name)?
-            }
+            Err(_) => extract_tensor_bytes_numpy(py, &cpu_tensor, &name)?,
         };
 
         tensor_data_vec.push(TensorData {
@@ -296,8 +240,6 @@ fn serialize_state_dict(
     Ok(serialized)
 }
 
-/// Fast path: read raw bytes directly from tensor storage via data_ptr + ctypes.
-/// Zero-copy read from PyTorch's memory — we only copy into our Vec<u8>.
 fn extract_tensor_bytes_fast(
     py: Python<'_>,
     tensor: &Bound<'_, PyAny>,
@@ -307,7 +249,6 @@ fn extract_tensor_bytes_fast(
         .import_bound("ctypes")
         .map_err(|e| SsError::Other(e.to_string()))?;
 
-    // Get raw data pointer: tensor.untyped_storage().data_ptr()
     let storage = tensor
         .call_method0("untyped_storage")
         .map_err(|e| SsError::Other(format!("untyped_storage failed: {e}")))?;
@@ -322,8 +263,6 @@ fn extract_tensor_bytes_fast(
         return Err(SsError::Other("Null data_ptr".into()));
     }
 
-    // Use ctypes to read nbytes from the pointer
-    // ctypes.string_at(ptr, nbytes) -> bytes
     let bytes_obj = ctypes
         .call_method1("string_at", (ptr_val, nbytes))
         .map_err(|e| SsError::Other(format!("ctypes.string_at failed: {e}")))?;
@@ -335,7 +274,6 @@ fn extract_tensor_bytes_fast(
     Ok(data)
 }
 
-/// Fallback: numpy roundtrip for tensors where fast path fails.
 fn extract_tensor_bytes_numpy(
     py: Python<'_>,
     tensor: &Bound<'_, PyAny>,
@@ -360,25 +298,110 @@ fn extract_tensor_bytes_numpy(
     Ok(data)
 }
 
-// ── Tensor reconstruction ────────────────────────────────────────────────────
+// ── Load via Python mmap (lazy, zero-copy views) ────────────────────────────
+//
+// Strategy: use Python's mmap module so the mmap object lives in Python's heap.
+// torch.frombuffer() on a mmap slice creates a view — no data copy.
+// The mmap stays alive as long as any tensor references it (Python refcount).
+// OS pages in data on demand. Same behavior as safetensors.torch.load_file.
 
-fn bytes_to_torch_tensor(
+/// Internal: parse header from a Python mmap/buffer to get tensor layout.
+/// Returns list of (name, dtype_str, shape, start_offset, end_offset).
+fn parse_tensor_layout(
+    py: Python<'_>,
+    mmap_obj: &Bound<'_, PyAny>,
+) -> PyResult<(Vec<(String, String, Vec<usize>, usize, usize)>, usize)> {
+    // Read first 8 bytes to get header length
+    let sl = PySlice::new_bound(py, 0, 8, 1);
+    let header_len_bytes = mmap_obj.call_method1("__getitem__", (sl,))?;
+    let header_len_bytes: Vec<u8> = header_len_bytes.extract()?;
+    let header_len = u64::from_le_bytes(header_len_bytes.try_into().map_err(|_| {
+        PyRuntimeError::new_err("Failed to read header length")
+    })?) as usize;
+
+    // Read header JSON
+    let data_start = 8 + header_len;
+    let sl = PySlice::new_bound(py, 8, data_start as isize, 1);
+    let header_slice = mmap_obj.call_method1("__getitem__", (sl,))?;
+    let header_bytes: Vec<u8> = header_slice.extract()?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| PyRuntimeError::new_err(format!("Invalid header JSON: {e}")))?;
+
+    let mut tensors = Vec::new();
+    if let Some(obj) = header.as_object() {
+        for (name, info) in obj {
+            if name == "__metadata__" {
+                continue;
+            }
+            let dtype = info
+                .get("dtype")
+                .and_then(|d| d.as_str())
+                .unwrap_or("F32")
+                .to_string();
+            let shape: Vec<usize> = info
+                .get("shape")
+                .and_then(|s| s.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .unwrap_or_default();
+            let offsets = info
+                .get("data_offsets")
+                .and_then(|o| o.as_array())
+                .map(|arr| {
+                    let vals: Vec<usize> = arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect();
+                    (vals.get(0).copied().unwrap_or(0), vals.get(1).copied().unwrap_or(0))
+                })
+                .unwrap_or((0, 0));
+
+            tensors.push((name.clone(), dtype, shape, offsets.0, offsets.1));
+        }
+    }
+
+    Ok((tensors, data_start))
+}
+
+/// Convert safetensors dtype string (from header) to torch dtype attribute name.
+fn st_dtype_to_torch(dtype: &str) -> &str {
+    match dtype {
+        "F64" => "float64",
+        "F32" => "float32",
+        "F16" => "float16",
+        "BF16" => "bfloat16",
+        "F8_E4M3" => "float8_e4m3fn",
+        "F8_E5M2" => "float8_e5m2",
+        "I64" => "int64",
+        "I32" => "int32",
+        "I16" => "int16",
+        "I8" => "int8",
+        "U8" => "uint8",
+        "BOOL" => "bool",
+        _ => "float32",
+    }
+}
+
+/// Create a tensor from a memoryview slice — true zero-copy.
+/// memoryview slicing doesn't copy data (unlike mmap.__getitem__).
+fn memview_slice_to_tensor(
     py: Python<'_>,
     torch: &Bound<'_, PyModule>,
-    view: &safetensors::tensor::TensorView<'_>,
+    memview: &Bound<'_, PyAny>,
+    dtype_str: &str,
+    shape: &[usize],
+    byte_start: usize,
+    byte_end: usize,
     device: &str,
 ) -> PyResult<PyObject> {
-    let dtype_str = torch_dtype_str(view.dtype());
-    let shape: Vec<usize> = view.shape().to_vec();
+    let torch_dtype = st_dtype_to_torch(dtype_str);
 
-    let bytes = PyBytes::new_bound(py, view.data());
+    // memoryview[start:end] is zero-copy — just adjusts pointer + length
+    let sl = PySlice::new_bound(py, byte_start as isize, byte_end as isize, 1);
+    let buf_slice = memview.call_method1("__getitem__", (sl,))?;
+
     let kwargs = PyDict::new_bound(py);
-    kwargs.set_item("dtype", torch.getattr(dtype_str)?)?;
+    kwargs.set_item("dtype", torch.getattr(torch_dtype)?)?;
 
-    let tensor = torch.call_method("frombuffer", (bytes,), Some(&kwargs))?;
-    let tensor = tensor.call_method1("reshape", (shape,))?;
-    // clone() to own the memory — frombuffer shares the mmap/bytes backing
-    let tensor = tensor.call_method0("clone")?;
+    let tensor = torch.call_method("frombuffer", (&buf_slice,), Some(&kwargs))?;
+    let shape_tuple = PyTuple::new_bound(py, shape.iter().map(|&s| s as i64));
+    let tensor = tensor.call_method1("reshape", (shape_tuple,))?;
 
     if device != "cpu" {
         let tensor = tensor.call_method1("to", (device,))?;
@@ -388,10 +411,9 @@ fn bytes_to_torch_tensor(
     }
 }
 
-// ── Python-exposed functions ─────────────────────────────────────────────────
+// ── Python-exposed functions ────────────────────────────────────────────────
 
 /// Save a state_dict using O_DIRECT — no page cache pollution.
-/// Writes in 4MB aligned chunks. This is the key function for training checkpoints.
 #[pyfunction]
 #[pyo3(signature = (state_dict, path, metadata=None))]
 fn save_file_direct(
@@ -419,94 +441,145 @@ fn save_file(
     Ok(())
 }
 
-/// Load all tensors from a safetensors file via mmap. Returns dict of name -> torch.Tensor.
-/// Drop-in replacement for safetensors.torch.load_file.
+/// Load all tensors from a safetensors file. Returns (dict, mmap_handle).
+/// Tensors are lazy mmap views — no data copied until accessed.
+/// The mmap_handle MUST be kept alive as long as tensors are in use.
+/// For convenience, use the Python wrapper which handles this automatically.
 #[pyfunction]
 #[pyo3(signature = (path, device="cpu"))]
-fn load_file(py: Python<'_>, path: &str, device: &str) -> PyResult<PyObject> {
-    let mmap = mmap_safetensors(path)?;
-    let st = SafeTensors::deserialize(&mmap)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
+fn _load_file_raw(py: Python<'_>, path: &str, device: &str) -> PyResult<PyObject> {
+    let mmap_mod = py.import_bound("mmap")?;
+    let builtins = py.import_bound("builtins")?;
     let torch = py.import_bound("torch")?;
+
+    // Open file and create read-only Python mmap
+    let f = builtins.call_method1("open", (path, "rb"))?;
+    let fileno = f.call_method0("fileno")?;
+    let mmap_kwargs = PyDict::new_bound(py);
+    mmap_kwargs.set_item("access", mmap_mod.getattr("ACCESS_READ")?)?;
+    let py_mmap = mmap_mod.call_method("mmap", (fileno, 0i64), Some(&mmap_kwargs))?;
+    f.call_method0("close")?;
+
+    // Parse tensor layout from header
+    let (tensors, data_start) = parse_tensor_layout(py, &py_mmap)?;
+
+    // Create memoryview — slicing this is zero-copy (unlike mmap.__getitem__)
+    let memview = builtins.call_method1("memoryview", (&py_mmap,))?;
+
     let result = PyDict::new_bound(py);
 
-    for (name, view) in st.tensors() {
-        let tensor = bytes_to_torch_tensor(py, &torch, &view, device)?;
+    for (name, dtype, shape, start, end) in &tensors {
+        let tensor = memview_slice_to_tensor(
+            py,
+            &torch,
+            &memview,
+            dtype,
+            shape,
+            data_start + start,
+            data_start + end,
+            device,
+        )?;
         result.set_item(name, tensor)?;
     }
 
-    Ok(result.into())
+    // Return tuple: (tensor_dict, mmap_handle)
+    // Python wrapper stores mmap_handle to keep it alive
+    let ret = PyTuple::new_bound(py, &[result.as_any(), py_mmap.as_any()]);
+    Ok(ret.into())
 }
 
-/// Load selected tensors by name. Only materializes the tensors you ask for.
+/// Load selected tensors by name. Returns (dict, mmap_handle).
 #[pyfunction]
 #[pyo3(signature = (path, names, device="cpu"))]
-fn load_selective(
+fn _load_selective_raw(
     py: Python<'_>,
     path: &str,
     names: Vec<String>,
     device: &str,
 ) -> PyResult<PyObject> {
-    let mmap = mmap_safetensors(path)?;
-    let st = SafeTensors::deserialize(&mmap)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
+    let mmap_mod = py.import_bound("mmap")?;
+    let builtins = py.import_bound("builtins")?;
     let torch = py.import_bound("torch")?;
+
+    let f = builtins.call_method1("open", (path, "rb"))?;
+    let fileno = f.call_method0("fileno")?;
+    let mmap_kwargs = PyDict::new_bound(py);
+    mmap_kwargs.set_item("access", mmap_mod.getattr("ACCESS_READ")?)?;
+    let py_mmap = mmap_mod.call_method("mmap", (fileno, 0i64), Some(&mmap_kwargs))?;
+    f.call_method0("close")?;
+
+    let (tensors, data_start) = parse_tensor_layout(py, &py_mmap)?;
+    let memview = builtins.call_method1("memoryview", (&py_mmap,))?;
+    let name_set: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+
     let result = PyDict::new_bound(py);
 
-    for name in &names {
-        if let Ok(view) = st.tensor(name) {
-            let tensor = bytes_to_torch_tensor(py, &torch, &view, device)?;
+    for (name, dtype, shape, start, end) in &tensors {
+        if name_set.contains(name.as_str()) {
+            let tensor = memview_slice_to_tensor(
+                py, &torch, &memview, dtype, shape,
+                data_start + start, data_start + end, device,
+            )?;
             result.set_item(name, tensor)?;
         }
     }
 
-    Ok(result.into())
+    let ret = PyTuple::new_bound(py, &[result.as_any(), py_mmap.as_any()]);
+    Ok(ret.into())
 }
 
-/// Load tensors whose names start with a given prefix.
+/// Load tensors matching a prefix. Returns (dict, mmap_handle).
 #[pyfunction]
 #[pyo3(signature = (path, prefix, device="cpu"))]
-fn load_by_prefix(
+fn _load_by_prefix_raw(
     py: Python<'_>,
     path: &str,
     prefix: &str,
     device: &str,
 ) -> PyResult<PyObject> {
-    let mmap = mmap_safetensors(path)?;
-    let st = SafeTensors::deserialize(&mmap)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
+    let mmap_mod = py.import_bound("mmap")?;
+    let builtins = py.import_bound("builtins")?;
     let torch = py.import_bound("torch")?;
+
+    let f = builtins.call_method1("open", (path, "rb"))?;
+    let fileno = f.call_method0("fileno")?;
+    let mmap_kwargs = PyDict::new_bound(py);
+    mmap_kwargs.set_item("access", mmap_mod.getattr("ACCESS_READ")?)?;
+    let py_mmap = mmap_mod.call_method("mmap", (fileno, 0i64), Some(&mmap_kwargs))?;
+    f.call_method0("close")?;
+
+    let (tensors, data_start) = parse_tensor_layout(py, &py_mmap)?;
+    let memview = builtins.call_method1("memoryview", (&py_mmap,))?;
+
     let result = PyDict::new_bound(py);
 
-    for (name, view) in st.tensors() {
+    for (name, dtype, shape, start, end) in &tensors {
         if name.starts_with(prefix) {
-            let tensor = bytes_to_torch_tensor(py, &torch, &view, device)?;
-            result.set_item(&name, tensor)?;
+            let tensor = memview_slice_to_tensor(
+                py, &torch, &memview, dtype, shape,
+                data_start + start, data_start + end, device,
+            )?;
+            result.set_item(name, tensor)?;
         }
     }
 
-    Ok(result.into())
+    let ret = PyTuple::new_bound(py, &[result.as_any(), py_mmap.as_any()]);
+    Ok(ret.into())
 }
 
-/// Get file metadata + tensor info without loading tensor data.
-/// Only reads the 8-byte length prefix + header bytes from disk.
+/// List tensor names and info without loading data. Header-only read.
 #[pyfunction]
 fn file_metadata(py: Python<'_>, path: &str) -> PyResult<PyObject> {
     let (user_metadata, header) = read_header(path)?;
 
     let result = PyDict::new_bound(py);
 
-    // User metadata
     let meta_dict = PyDict::new_bound(py);
     for (k, v) in &user_metadata {
         meta_dict.set_item(k, v)?;
     }
     result.set_item("metadata", meta_dict)?;
 
-    // Tensor info from header (no tensor data touched)
     let tensors_dict = PyDict::new_bound(py);
     if let Some(obj) = header.as_object() {
         for (name, tensor_info) in obj {
@@ -518,14 +591,12 @@ fn file_metadata(py: Python<'_>, path: &str) -> PyResult<PyObject> {
             if let Some(dtype_str) = tensor_info.get("dtype").and_then(|d| d.as_str()) {
                 info.set_item("dtype", dtype_str)?;
 
-                // Parse shape
                 if let Some(shape_arr) = tensor_info.get("shape").and_then(|s| s.as_array()) {
                     let shape: Vec<u64> = shape_arr
                         .iter()
                         .filter_map(|v| v.as_u64())
                         .collect();
 
-                    // Calculate nbytes from dtype + shape
                     let numel: u64 = shape.iter().product();
                     let elem_size = match dtype_str {
                         "F64" | "I64" => 8u64,
@@ -539,7 +610,6 @@ fn file_metadata(py: Python<'_>, path: &str) -> PyResult<PyObject> {
                     info.set_item("nbytes", numel * elem_size)?;
                 }
 
-                // Also include offsets if available
                 if let Some(offsets) = tensor_info.get("data_offsets").and_then(|o| o.as_array()) {
                     let offs: Vec<u64> = offsets.iter().filter_map(|v| v.as_u64()).collect();
                     if offs.len() == 2 {
@@ -589,27 +659,34 @@ fn training_metadata(
     Ok(dict.into())
 }
 
-// ── Module definition ────────────────────────────────────────────────────────
+/// List tensor names in a file without loading any data. Fast header-only read.
+#[pyfunction]
+fn tensor_names(path: &str) -> PyResult<Vec<String>> {
+    let (_, header) = read_header(path)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    let mut names = Vec::new();
+    if let Some(obj) = header.as_object() {
+        for name in obj.keys() {
+            if name != "__metadata__" {
+                names.push(name.clone());
+            }
+        }
+    }
+    Ok(names)
+}
+
+// ── Module definition ───────────────────────────────────────────────────────
 
 #[pymodule]
 fn serenity_safetensors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(save_file_direct, m)?)?;
     m.add_function(wrap_pyfunction!(save_file, m)?)?;
-    m.add_function(wrap_pyfunction!(load_file, m)?)?;
-    m.add_function(wrap_pyfunction!(load_selective, m)?)?;
-    m.add_function(wrap_pyfunction!(load_by_prefix, m)?)?;
+    m.add_function(wrap_pyfunction!(_load_file_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(_load_selective_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(_load_by_prefix_raw, m)?)?;
     m.add_function(wrap_pyfunction!(file_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(training_metadata, m)?)?;
-
-    let torch_mod = PyModule::new_bound(m.py(), "torch")?;
-    torch_mod.add_function(wrap_pyfunction!(save_file_direct, &torch_mod)?)?;
-    torch_mod.add_function(wrap_pyfunction!(save_file, &torch_mod)?)?;
-    torch_mod.add_function(wrap_pyfunction!(load_file, &torch_mod)?)?;
-    torch_mod.add_function(wrap_pyfunction!(load_selective, &torch_mod)?)?;
-    torch_mod.add_function(wrap_pyfunction!(load_by_prefix, &torch_mod)?)?;
-    torch_mod.add_function(wrap_pyfunction!(file_metadata, &torch_mod)?)?;
-    torch_mod.add_function(wrap_pyfunction!(training_metadata, &torch_mod)?)?;
-    m.add_submodule(&torch_mod)?;
-
+    m.add_function(wrap_pyfunction!(tensor_names, m)?)?;
     Ok(())
 }

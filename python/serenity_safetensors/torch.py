@@ -12,9 +12,10 @@ Additional:
     load_by_prefix    — load tensors matching a prefix
     file_metadata     — header-only inspect (no tensor data read)
     training_metadata — build metadata dict for checkpoints
+    tensor_names      — list tensor names without loading data
 """
 
-from .serenity_safetensors import (
+from . import (
     save_file_direct,
     save_file,
     load_file,
@@ -22,6 +23,7 @@ from .serenity_safetensors import (
     load_by_prefix,
     file_metadata,
     training_metadata,
+    tensor_names,
 )
 
 __all__ = [
@@ -32,4 +34,5 @@ __all__ = [
     "load_by_prefix",
     "file_metadata",
     "training_metadata",
+    "tensor_names",
 ]
