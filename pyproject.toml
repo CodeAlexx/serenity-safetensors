@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "serenity-safetensors"
+version = "0.2.0"
+description = "High-performance safetensors I/O with O_DIRECT and mmap support for Serenity"
+requires-python = ">=3.10"
+dependencies = ["torch", "numpy"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "serenity_safetensors.serenity_safetensors"

@@ -1,0 +1,25 @@
+[package]
+name = "serenity-safetensors"
+version = "0.2.0"
+edition = "2021"
+description = "High-performance safetensors I/O with O_DIRECT and mmap support for Serenity"
+
+[lib]
+name = "serenity_safetensors"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+safetensors = "0.4"
+memmap2 = "0.9"
+serde_json = "1.0"
+thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
