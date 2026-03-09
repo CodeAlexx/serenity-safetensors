@@ -19,8 +19,10 @@ from .serenity_safetensors import (
     _load_selective_raw,
     _load_by_prefix_raw,
     file_metadata,
+    tensor_layout,
     training_metadata,
     tensor_names,
+    shard_index,
 )
 
 
@@ -87,8 +89,10 @@ __all__ = [
     "load_selective",
     "load_by_prefix",
     "file_metadata",
+    "tensor_layout",
     "training_metadata",
     "tensor_names",
+    "shard_index",
     "SafeTensorsDict",
     "torch",
 ]

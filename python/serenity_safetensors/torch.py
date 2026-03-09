@@ -22,8 +22,10 @@ from . import (
     load_selective,
     load_by_prefix,
     file_metadata,
+    tensor_layout,
     training_metadata,
     tensor_names,
+    shard_index,
 )
 
 __all__ = [
@@ -33,6 +35,8 @@ __all__ = [
     "load_selective",
     "load_by_prefix",
     "file_metadata",
+    "tensor_layout",
     "training_metadata",
     "tensor_names",
+    "shard_index",
 ]

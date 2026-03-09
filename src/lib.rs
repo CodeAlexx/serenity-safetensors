@@ -1,9 +1,11 @@
 use pyo3::exceptions::{PyIOError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySlice, PyTuple};
-use safetensors::tensor::{Dtype as StDtype, TensorView};
+use safetensors::tensor::{Dtype as StDtype, View};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 // ── Error types ──────────────────────────────────────────────────────────────
@@ -53,17 +55,50 @@ fn dtype_from_torch_str(s: &str) -> Result<StDtype, SsError> {
 
 fn dtype_element_size(dtype: StDtype) -> usize {
     match dtype {
-        StDtype::F64 | StDtype::I64 => 8,
-        StDtype::F32 | StDtype::I32 => 4,
-        StDtype::F16 | StDtype::BF16 | StDtype::I16 => 2,
+        StDtype::F64 | StDtype::I64 | StDtype::U64 => 8,
+        StDtype::F32 | StDtype::I32 | StDtype::U32 => 4,
+        StDtype::F16 | StDtype::BF16 | StDtype::I16 | StDtype::U16 => 2,
         StDtype::F8_E4M3 | StDtype::F8_E5M2 | StDtype::I8 | StDtype::U8 | StDtype::BOOL => 1,
         _ => 4,
     }
 }
 
+fn dtype_to_safetensors_str(dtype: StDtype) -> &'static str {
+    match dtype {
+        StDtype::BOOL => "BOOL",
+        StDtype::U8 => "U8",
+        StDtype::I8 => "I8",
+        StDtype::F8_E5M2 => "F8_E5M2",
+        StDtype::F8_E4M3 => "F8_E4M3",
+        StDtype::I16 => "I16",
+        StDtype::U16 => "U16",
+        StDtype::F16 => "F16",
+        StDtype::BF16 => "BF16",
+        StDtype::I32 => "I32",
+        StDtype::U32 => "U32",
+        StDtype::F32 => "F32",
+        StDtype::F64 => "F64",
+        StDtype::I64 => "I64",
+        StDtype::U64 => "U64",
+        _ => "F32",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorLayoutEntry {
+    name: String,
+    dtype: String,
+    shape: Vec<usize>,
+    nbytes: usize,
+    data_offsets: (usize, usize),
+    absolute_offsets: (usize, usize),
+}
+
 // ── Header-only file read ───────────────────────────────────────────────────
 
-fn read_header(path: &str) -> Result<(HashMap<String, String>, serde_json::Value), SsError> {
+fn read_header_with_len(
+    path: &str,
+) -> Result<(HashMap<String, String>, serde_json::Value, usize), SsError> {
     use std::io::Read;
     let mut file = fs::File::open(path)?;
 
@@ -92,102 +127,170 @@ fn read_header(path: &str) -> Result<(HashMap<String, String>, serde_json::Value
             }
         }
     }
-    Ok((metadata, header))
+    Ok((metadata, header, header_len))
 }
 
-// ── O_DIRECT chunked write ──────────────────────────────────────────────────
+fn collect_tensor_layout(
+    path: &str,
+) -> Result<(HashMap<String, String>, Vec<TensorLayoutEntry>), SsError> {
+    let (metadata, header, header_len) = read_header_with_len(path)?;
+    let data_base = 8 + header_len;
 
-#[cfg(unix)]
-fn write_direct(path: &Path, data: &[u8]) -> Result<(), SsError> {
-    let c_path = std::ffi::CString::new(path.to_str().unwrap_or(""))
-        .map_err(|e| SsError::Other(e.to_string()))?;
-
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT,
-            0o644,
-        )
-    };
-
-    if fd < 0 {
-        fs::write(path, data)?;
-        return Ok(());
-    }
-
-    const ALIGN: usize = 4096;
-    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
-
-    let alloc_size = (CHUNK_SIZE + ALIGN - 1) & !(ALIGN - 1);
-    let layout = std::alloc::Layout::from_size_align(alloc_size, ALIGN)
-        .map_err(|e| SsError::Other(e.to_string()))?;
-
-    unsafe {
-        let buf = std::alloc::alloc_zeroed(layout);
-        if buf.is_null() {
-            libc::close(fd);
-            return Err(SsError::Other("Failed to allocate aligned buffer".into()));
-        }
-
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let remaining = data.len() - offset;
-            let this_chunk = remaining.min(CHUNK_SIZE);
-            let write_len = (this_chunk + ALIGN - 1) & !(ALIGN - 1);
-
-            std::ptr::write_bytes(buf, 0, alloc_size);
-            std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), buf, this_chunk);
-
-            let written = libc::write(fd, buf as *const libc::c_void, write_len);
-            if written < 0 {
-                let err = std::io::Error::last_os_error();
-                std::alloc::dealloc(buf, layout);
-                libc::close(fd);
-                return Err(SsError::Io(err));
+    let mut entries = Vec::new();
+    if let Some(obj) = header.as_object() {
+        for (name, tensor_info) in obj {
+            if name == "__metadata__" {
+                continue;
             }
+            let dtype = tensor_info
+                .get("dtype")
+                .and_then(|d| d.as_str())
+                .unwrap_or("F32")
+                .to_string();
+            let shape: Vec<usize> = tensor_info
+                .get("shape")
+                .and_then(|s| s.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let data_offsets = tensor_info
+                .get("data_offsets")
+                .and_then(|o| o.as_array())
+                .map(|arr| {
+                    let vals: Vec<usize> = arr
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect();
+                    (
+                        vals.first().copied().unwrap_or(0),
+                        vals.get(1).copied().unwrap_or(0),
+                    )
+                })
+                .unwrap_or((0, 0));
+            let nbytes = data_offsets.1.saturating_sub(data_offsets.0);
 
-            offset += this_chunk;
+            entries.push(TensorLayoutEntry {
+                name: name.clone(),
+                dtype,
+                shape,
+                nbytes,
+                data_offsets,
+                absolute_offsets: (data_base + data_offsets.0, data_base + data_offsets.1),
+            });
         }
+    }
+    entries.sort_by_key(|entry| entry.data_offsets.0);
 
-        libc::ftruncate(fd, data.len() as libc::off_t);
-        libc::close(fd);
-        std::alloc::dealloc(buf, layout);
+    Ok((metadata, entries))
+}
+
+fn read_shard_index(path: &str) -> Result<serde_json::Value, SsError> {
+    let raw = fs::read_to_string(path)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+    Ok(parsed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShardIndexSummary {
+    metadata_strings: HashMap<String, String>,
+    metadata_numbers: HashMap<String, u64>,
+    weight_map: HashMap<String, String>,
+    shards: HashMap<String, Vec<String>>,
+}
+
+fn summarize_shard_index(parsed: &serde_json::Value) -> ShardIndexSummary {
+    let mut metadata_strings = HashMap::new();
+    let mut metadata_numbers = HashMap::new();
+    if let Some(metadata) = parsed.get("metadata").and_then(|value| value.as_object()) {
+        for (key, value) in metadata {
+            if let Some(as_str) = value.as_str() {
+                metadata_strings.insert(key.clone(), as_str.to_string());
+            } else if let Some(as_u64) = value.as_u64() {
+                metadata_numbers.insert(key.clone(), as_u64);
+            }
+        }
     }
 
-    Ok(())
+    let mut weight_map = HashMap::new();
+    let mut shards: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(weights) = parsed.get("weight_map").and_then(|value| value.as_object()) {
+        for (tensor_name, shard_name) in weights {
+            if let Some(shard) = shard_name.as_str() {
+                weight_map.insert(tensor_name.clone(), shard.to_string());
+                shards
+                    .entry(shard.to_string())
+                    .or_default()
+                    .push(tensor_name.clone());
+            }
+        }
+    }
+    for tensors in shards.values_mut() {
+        tensors.sort();
+    }
+
+    ShardIndexSummary {
+        metadata_strings,
+        metadata_numbers,
+        weight_map,
+        shards,
+    }
 }
 
-#[cfg(not(unix))]
-fn write_direct(path: &Path, data: &[u8]) -> Result<(), SsError> {
-    fs::write(path, data)?;
-    Ok(())
-}
+// ── Streaming write helpers ─────────────────────────────────────────────────
 
-// ── Serialize state_dict ────────────────────────────────────────────────────
-
-struct TensorData {
-    name: String,
+struct PythonTensorView {
     dtype: StDtype,
     shape: Vec<usize>,
-    data: Vec<u8>,
+    data_ptr: usize,
+    nbytes: usize,
+    tensor: Py<PyAny>,
 }
 
-fn serialize_state_dict(
-    py: Python<'_>,
-    state_dict: &Bound<'_, PyDict>,
-    metadata: Option<&Bound<'_, PyDict>>,
-) -> Result<Vec<u8>, SsError> {
-    let meta_map: Option<HashMap<String, String>> = metadata.map(|m| {
-        m.iter()
-            .filter_map(|(k, v)| {
-                let key = k.extract::<String>().ok()?;
-                let val = v.extract::<String>().ok()?;
-                Some((key, val))
-            })
-            .collect()
-    });
+impl View for PythonTensorView {
+    fn dtype(&self) -> StDtype {
+        self.dtype
+    }
 
-    let mut tensor_data_vec: Vec<TensorData> = Vec::new();
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        let ptr = if self.nbytes == 0 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            self.data_ptr as *const u8
+        };
+        let _keep_alive = &self.tensor;
+        unsafe { Cow::Borrowed(std::slice::from_raw_parts(ptr, self.nbytes)) }
+    }
+
+    fn data_len(&self) -> usize {
+        self.nbytes
+    }
+}
+
+fn metadata_from_py_dict(
+    metadata: Option<&Bound<'_, PyDict>>,
+) -> Result<Option<HashMap<String, String>>, SsError> {
+    Ok(metadata.map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.extract::<String>().ok()?;
+                    let val = v.extract::<String>().ok()?;
+                    Some((key, val))
+                })
+                .collect()
+        }))
+}
+
+fn prepare_python_tensor_views(
+    state_dict: &Bound<'_, PyDict>,
+) -> Result<Vec<(String, PythonTensorView)>, SsError> {
+    let mut views = Vec::with_capacity(state_dict.len());
 
     for (key, value) in state_dict.iter() {
         let name: String = key.extract().map_err(|e| SsError::Other(e.to_string()))?;
@@ -212,90 +315,210 @@ fn serialize_state_dict(
         let numel: usize = shape.iter().product();
         let nbytes = numel * dtype_element_size(st_dtype);
 
-        let data = match extract_tensor_bytes_fast(py, &cpu_tensor, nbytes) {
-            Ok(d) => d,
-            Err(_) => extract_tensor_bytes_numpy(py, &cpu_tensor, &name)?,
+        let storage = cpu_tensor
+            .call_method0("untyped_storage")
+            .map_err(|e| SsError::Other(format!("untyped_storage failed for {name}: {e}")))?;
+        let data_ptr = storage
+            .call_method0("data_ptr")
+            .map_err(|e| SsError::Other(format!("data_ptr failed for {name}: {e}")))?
+            .extract::<usize>()
+            .map_err(|e| SsError::Other(format!("ptr extract failed for {name}: {e}")))?;
+
+        if data_ptr == 0 && nbytes > 0 {
+            return Err(SsError::Other(format!("Null data_ptr for {name}")));
+        }
+
+        views.push((
+            name,
+            PythonTensorView {
+                dtype: st_dtype,
+                shape,
+                data_ptr,
+                nbytes,
+                tensor: cpu_tensor.unbind(),
+            },
+        ));
+    }
+
+    Ok(views)
+}
+
+fn prepare_write_plan<V: View>(
+    mut tensors: Vec<(String, V)>,
+    metadata: &Option<HashMap<String, String>>,
+) -> Result<(u64, Vec<u8>, Vec<(String, V)>, usize), SsError> {
+    tensors.sort_by(|(lname, left), (rname, right)| {
+        right.dtype().cmp(&left.dtype()).then(lname.cmp(rname))
+    });
+
+    let mut header = serde_json::Map::new();
+    if let Some(metadata) = metadata {
+        header.insert(
+            "__metadata__".to_string(),
+            serde_json::to_value(metadata)?,
+        );
+    }
+
+    let mut offset = 0usize;
+    for (name, tensor) in &tensors {
+        let tensor_len = tensor.data_len();
+        let info = serde_json::json!({
+            "dtype": dtype_to_safetensors_str(tensor.dtype()),
+            "shape": tensor.shape(),
+            "data_offsets": [offset, offset + tensor_len],
+        });
+        header.insert(name.clone(), info);
+        offset += tensor_len;
+    }
+
+    let mut header_bytes = serde_json::to_vec(&serde_json::Value::Object(header))?;
+    let extra = (8 - header_bytes.len() % 8) % 8;
+    header_bytes.extend(std::iter::repeat(b' ').take(extra));
+    let header_len = header_bytes.len() as u64;
+
+    Ok((header_len, header_bytes, tensors, offset))
+}
+
+fn write_standard_streaming<V: View>(
+    path: &Path,
+    header_len: u64,
+    header_bytes: &[u8],
+    tensors: &[(String, V)],
+) -> Result<(), SsError> {
+    let file = fs::File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&header_len.to_le_bytes())?;
+    writer.write_all(header_bytes)?;
+    for (_, tensor) in tensors {
+        let data = tensor.data();
+        writer.write_all(data.as_ref())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+// ── O_DIRECT chunked write ──────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn write_direct_streaming<V: View>(
+    path: &Path,
+    header_len: u64,
+    header_bytes: &[u8],
+    tensors: &[(String, V)],
+    total_tensor_bytes: usize,
+) -> Result<(), SsError> {
+    let c_path = std::ffi::CString::new(path.to_str().unwrap_or(""))
+        .map_err(|e| SsError::Other(e.to_string()))?;
+
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT,
+            0o644,
+        )
+    };
+
+    if fd < 0 {
+        return write_standard_streaming(path, header_len, header_bytes, tensors);
+    }
+
+    const ALIGN: usize = 4096;
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+    let alloc_size = (CHUNK_SIZE + ALIGN - 1) & !(ALIGN - 1);
+    let layout = std::alloc::Layout::from_size_align(alloc_size, ALIGN)
+        .map_err(|e| SsError::Other(e.to_string()))?;
+
+    unsafe {
+        let buf = std::alloc::alloc_zeroed(layout);
+        if buf.is_null() {
+            libc::close(fd);
+            return Err(SsError::Other("Failed to allocate aligned buffer".into()));
+        }
+
+        let mut buffered = 0usize;
+        let mut exact_len = 0usize;
+
+        let flush_buffer = |buffered: &mut usize| -> Result<(), SsError> {
+            if *buffered == 0 {
+                return Ok(());
+            }
+            let write_len = (*buffered + ALIGN - 1) & !(ALIGN - 1);
+            if write_len > *buffered {
+                std::ptr::write_bytes(buf.add(*buffered), 0, write_len - *buffered);
+            }
+            let written = libc::write(fd, buf as *const libc::c_void, write_len);
+            if written < 0 {
+                return Err(SsError::Io(std::io::Error::last_os_error()));
+            }
+            *buffered = 0;
+            Ok(())
         };
 
-        tensor_data_vec.push(TensorData {
-            name,
-            dtype: st_dtype,
-            shape,
-            data,
-        });
+        let copy_segment = |segment: &[u8],
+                            buffered: &mut usize,
+                            exact_len: &mut usize|
+         -> Result<(), SsError> {
+            let mut segment_offset = 0usize;
+            *exact_len += segment.len();
+            while segment_offset < segment.len() {
+                let space = CHUNK_SIZE - *buffered;
+                let take = (segment.len() - segment_offset).min(space);
+                std::ptr::copy_nonoverlapping(
+                    segment.as_ptr().add(segment_offset),
+                    buf.add(*buffered),
+                    take,
+                );
+                *buffered += take;
+                segment_offset += take;
+                if *buffered == CHUNK_SIZE {
+                    flush_buffer(buffered)?;
+                }
+            }
+            Ok(())
+        };
+
+        let header_len_bytes = header_len.to_le_bytes();
+        let write_result = (|| -> Result<(), SsError> {
+            copy_segment(&header_len_bytes, &mut buffered, &mut exact_len)?;
+            copy_segment(header_bytes, &mut buffered, &mut exact_len)?;
+            for (_, tensor) in tensors {
+                let data = tensor.data();
+                copy_segment(data.as_ref(), &mut buffered, &mut exact_len)?;
+            }
+            flush_buffer(&mut buffered)?;
+            let expected_len = 8 + header_bytes.len() + total_tensor_bytes;
+            if exact_len != expected_len {
+                return Err(SsError::Other(format!(
+                    "Streaming write length mismatch: expected {expected_len}, wrote {exact_len}"
+                )));
+            }
+            libc::ftruncate(fd, expected_len as libc::off_t);
+            Ok(())
+        })();
+
+        let close_result = libc::close(fd);
+        std::alloc::dealloc(buf, layout);
+        if let Err(err) = write_result {
+            return Err(err);
+        }
+        if close_result < 0 {
+            return Err(SsError::Io(std::io::Error::last_os_error()));
+        }
     }
 
-    let views: Vec<(String, TensorView<'_>)> = tensor_data_vec
-        .iter()
-        .map(|td| {
-            (
-                td.name.clone(),
-                TensorView::new(td.dtype, td.shape.clone(), &td.data)
-                    .expect("Invalid tensor view"),
-            )
-        })
-        .collect();
-
-    let serialized = safetensors::tensor::serialize(views, &meta_map)?;
-    Ok(serialized)
+    Ok(())
 }
 
-fn extract_tensor_bytes_fast(
-    py: Python<'_>,
-    tensor: &Bound<'_, PyAny>,
-    nbytes: usize,
-) -> Result<Vec<u8>, SsError> {
-    let ctypes = py
-        .import_bound("ctypes")
-        .map_err(|e| SsError::Other(e.to_string()))?;
-
-    let storage = tensor
-        .call_method0("untyped_storage")
-        .map_err(|e| SsError::Other(format!("untyped_storage failed: {e}")))?;
-    let data_ptr = storage
-        .call_method0("data_ptr")
-        .map_err(|e| SsError::Other(format!("data_ptr failed: {e}")))?;
-    let ptr_val: usize = data_ptr
-        .extract()
-        .map_err(|e| SsError::Other(format!("ptr extract failed: {e}")))?;
-
-    if ptr_val == 0 {
-        return Err(SsError::Other("Null data_ptr".into()));
-    }
-
-    let bytes_obj = ctypes
-        .call_method1("string_at", (ptr_val, nbytes))
-        .map_err(|e| SsError::Other(format!("ctypes.string_at failed: {e}")))?;
-
-    let data: Vec<u8> = bytes_obj
-        .extract()
-        .map_err(|e| SsError::Other(format!("bytes extract failed: {e}")))?;
-
-    Ok(data)
-}
-
-fn extract_tensor_bytes_numpy(
-    py: Python<'_>,
-    tensor: &Bound<'_, PyAny>,
-    name: &str,
-) -> Result<Vec<u8>, SsError> {
-    let numpy = py
-        .import_bound("numpy")
-        .map_err(|e| SsError::Other(e.to_string()))?;
-
-    let np_array = numpy
-        .call_method1("asarray", (tensor,))
-        .map_err(|e| SsError::Other(format!("numpy asarray failed for {name}: {e}")))?;
-
-    let bytes_obj = np_array
-        .call_method0("tobytes")
-        .map_err(|e| SsError::Other(format!("tobytes failed for {name}: {e}")))?;
-
-    let data: Vec<u8> = bytes_obj
-        .extract()
-        .map_err(|e| SsError::Other(format!("bytes extract failed for {name}: {e}")))?;
-
-    Ok(data)
+#[cfg(not(unix))]
+fn write_direct_streaming<V: View>(
+    path: &Path,
+    header_len: u64,
+    header_bytes: &[u8],
+    tensors: &[(String, V)],
+    _total_tensor_bytes: usize,
+) -> Result<(), SsError> {
+    write_standard_streaming(path, header_len, header_bytes, tensors)
 }
 
 // ── Load via Python mmap (lazy, zero-copy views) ────────────────────────────
@@ -417,13 +640,21 @@ fn memview_slice_to_tensor(
 #[pyfunction]
 #[pyo3(signature = (state_dict, path, metadata=None))]
 fn save_file_direct(
-    py: Python<'_>,
     state_dict: &Bound<'_, PyDict>,
     path: &str,
     metadata: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<()> {
-    let data = serialize_state_dict(py, state_dict, metadata)?;
-    write_direct(Path::new(path), &data)?;
+    let views = prepare_python_tensor_views(state_dict)?;
+    let metadata = metadata_from_py_dict(metadata)?;
+    let (header_len, header_bytes, views, total_tensor_bytes) =
+        prepare_write_plan(views, &metadata)?;
+    write_direct_streaming(
+        Path::new(path),
+        header_len,
+        &header_bytes,
+        &views,
+        total_tensor_bytes,
+    )?;
     Ok(())
 }
 
@@ -431,13 +662,14 @@ fn save_file_direct(
 #[pyfunction]
 #[pyo3(signature = (state_dict, path, metadata=None))]
 fn save_file(
-    py: Python<'_>,
     state_dict: &Bound<'_, PyDict>,
     path: &str,
     metadata: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<()> {
-    let data = serialize_state_dict(py, state_dict, metadata)?;
-    fs::write(path, data)?;
+    let views = prepare_python_tensor_views(state_dict)?;
+    let metadata = metadata_from_py_dict(metadata)?;
+    let (header_len, header_bytes, views, _) = prepare_write_plan(views, &metadata)?;
+    write_standard_streaming(Path::new(path), header_len, &header_bytes, &views)?;
     Ok(())
 }
 
@@ -570,7 +802,7 @@ fn _load_by_prefix_raw(
 /// List tensor names and info without loading data. Header-only read.
 #[pyfunction]
 fn file_metadata(py: Python<'_>, path: &str) -> PyResult<PyObject> {
-    let (user_metadata, header) = read_header(path)?;
+    let (user_metadata, entries) = collect_tensor_layout(path)?;
 
     let result = PyDict::new_bound(py);
 
@@ -581,48 +813,59 @@ fn file_metadata(py: Python<'_>, path: &str) -> PyResult<PyObject> {
     result.set_item("metadata", meta_dict)?;
 
     let tensors_dict = PyDict::new_bound(py);
-    if let Some(obj) = header.as_object() {
-        for (name, tensor_info) in obj {
-            if name == "__metadata__" {
-                continue;
-            }
-            let info = PyDict::new_bound(py);
-
-            if let Some(dtype_str) = tensor_info.get("dtype").and_then(|d| d.as_str()) {
-                info.set_item("dtype", dtype_str)?;
-
-                if let Some(shape_arr) = tensor_info.get("shape").and_then(|s| s.as_array()) {
-                    let shape: Vec<u64> = shape_arr
-                        .iter()
-                        .filter_map(|v| v.as_u64())
-                        .collect();
-
-                    let numel: u64 = shape.iter().product();
-                    let elem_size = match dtype_str {
-                        "F64" | "I64" => 8u64,
-                        "F32" | "I32" => 4,
-                        "F16" | "BF16" | "I16" => 2,
-                        "F8_E4M3" | "F8_E5M2" | "I8" | "U8" | "BOOL" => 1,
-                        _ => 4,
-                    };
-
-                    info.set_item("shape", &shape)?;
-                    info.set_item("nbytes", numel * elem_size)?;
-                }
-
-                if let Some(offsets) = tensor_info.get("data_offsets").and_then(|o| o.as_array()) {
-                    let offs: Vec<u64> = offsets.iter().filter_map(|v| v.as_u64()).collect();
-                    if offs.len() == 2 {
-                        info.set_item("data_offsets", (&offs[0], &offs[1]))?;
-                    }
-                }
-            }
-
-            tensors_dict.set_item(name, info)?;
-        }
+    for entry in &entries {
+        let info = PyDict::new_bound(py);
+        let shape: Vec<u64> = entry.shape.iter().map(|&n| n as u64).collect();
+        let data_offsets = (entry.data_offsets.0 as u64, entry.data_offsets.1 as u64);
+        let absolute_offsets = (
+            entry.absolute_offsets.0 as u64,
+            entry.absolute_offsets.1 as u64,
+        );
+        info.set_item("dtype", &entry.dtype)?;
+        info.set_item("shape", &shape)?;
+        info.set_item("nbytes", entry.nbytes as u64)?;
+        info.set_item("data_offsets", data_offsets)?;
+        info.set_item("absolute_offsets", absolute_offsets)?;
+        tensors_dict.set_item(&entry.name, info)?;
     }
     result.set_item("tensors", tensors_dict)?;
 
+    Ok(result.into())
+}
+
+/// Return tensor layout with absolute offsets for Stagehand-style consumers.
+#[pyfunction]
+fn tensor_layout(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let (user_metadata, entries) = collect_tensor_layout(path)?;
+    let result = PyDict::new_bound(py);
+
+    let meta_dict = PyDict::new_bound(py);
+    for (k, v) in &user_metadata {
+        meta_dict.set_item(k, v)?;
+    }
+    result.set_item("metadata", meta_dict)?;
+
+    let tensors = PyDict::new_bound(py);
+    for entry in &entries {
+        let item = PyDict::new_bound(py);
+        let shape: Vec<u64> = entry.shape.iter().map(|&n| n as u64).collect();
+        item.set_item("dtype", &entry.dtype)?;
+        item.set_item("shape", shape)?;
+        item.set_item("nbytes", entry.nbytes as u64)?;
+        item.set_item(
+            "data_offsets",
+            (entry.data_offsets.0 as u64, entry.data_offsets.1 as u64),
+        )?;
+        item.set_item(
+            "absolute_offsets",
+            (
+                entry.absolute_offsets.0 as u64,
+                entry.absolute_offsets.1 as u64,
+            ),
+        )?;
+        tensors.set_item(&entry.name, item)?;
+    }
+    result.set_item("tensors", tensors)?;
     Ok(result.into())
 }
 
@@ -662,18 +905,39 @@ fn training_metadata(
 /// List tensor names in a file without loading any data. Fast header-only read.
 #[pyfunction]
 fn tensor_names(path: &str) -> PyResult<Vec<String>> {
-    let (_, header) = read_header(path)
+    let (_, entries) = collect_tensor_layout(path)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(entries.into_iter().map(|entry| entry.name).collect())
+}
 
-    let mut names = Vec::new();
-    if let Some(obj) = header.as_object() {
-        for name in obj.keys() {
-            if name != "__metadata__" {
-                names.push(name.clone());
-            }
-        }
+/// Parse a diffusers-style safetensors shard index JSON.
+#[pyfunction]
+fn shard_index(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let parsed = read_shard_index(path)?;
+    let summary = summarize_shard_index(&parsed);
+    let result = PyDict::new_bound(py);
+
+    let metadata_dict = PyDict::new_bound(py);
+    for (k, v) in &summary.metadata_strings {
+        metadata_dict.set_item(k, v)?;
     }
-    Ok(names)
+    for (k, v) in &summary.metadata_numbers {
+        metadata_dict.set_item(k, v)?;
+    }
+    result.set_item("metadata", metadata_dict)?;
+
+    let weight_map_dict = PyDict::new_bound(py);
+    let shards_dict = PyDict::new_bound(py);
+    for (tensor_name, shard_name) in &summary.weight_map {
+        weight_map_dict.set_item(tensor_name, shard_name)?;
+    }
+    for (shard, tensors) in &summary.shards {
+        shards_dict.set_item(shard, tensors)?;
+    }
+    result.set_item("weight_map", weight_map_dict)?;
+    result.set_item("shards", shards_dict)?;
+
+    Ok(result.into())
 }
 
 // ── Module definition ───────────────────────────────────────────────────────
@@ -686,7 +950,251 @@ fn serenity_safetensors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_load_selective_raw, m)?)?;
     m.add_function(wrap_pyfunction!(_load_by_prefix_raw, m)?)?;
     m.add_function(wrap_pyfunction!(file_metadata, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_layout, m)?)?;
     m.add_function(wrap_pyfunction!(training_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_names, m)?)?;
+    m.add_function(wrap_pyfunction!(shard_index, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safetensors::tensor::TensorView;
+    use safetensors::{serialize, SafeTensors};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Clone)]
+    struct ByteView {
+        dtype: StDtype,
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    impl View for ByteView {
+        fn dtype(&self) -> StDtype {
+            self.dtype
+        }
+
+        fn shape(&self) -> &[usize] {
+            &self.shape
+        }
+
+        fn data(&self) -> Cow<'_, [u8]> {
+            Cow::Borrowed(&self.data)
+        }
+
+        fn data_len(&self) -> usize {
+            self.data.len()
+        }
+    }
+
+    fn temp_path(name: &str, suffix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let pid = std::process::id();
+        std::env::temp_dir()
+            .join(format!("serenity_safetensors_{name}_{pid}_{nanos}.{suffix}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn write_test_safetensors(path: &str) {
+        let weight_data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let bias_data: Vec<u8> = [5i8, 6i8, 7i8]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let metadata = HashMap::from([
+            ("family".to_string(), "ltx2".to_string()),
+            ("step".to_string(), "3".to_string()),
+        ]);
+        let views = vec![
+            (
+                "weight".to_string(),
+                TensorView::new(StDtype::F32, vec![2, 2], &weight_data).expect("weight view"),
+            ),
+            (
+                "bias".to_string(),
+                TensorView::new(StDtype::I8, vec![3], &bias_data).expect("bias view"),
+            ),
+        ];
+        let serialized = serialize(views, &Some(metadata)).expect("serialize");
+        fs::write(path, serialized).expect("write test safetensors");
+    }
+
+    #[test]
+    fn dtype_aliases_cover_fp8_and_bfloat16() {
+        assert_eq!(dtype_from_torch_str("torch.bfloat16").expect("bf16"), StDtype::BF16);
+        assert_eq!(
+            dtype_from_torch_str("float8_e4m3fn").expect("fp8 e4m3"),
+            StDtype::F8_E4M3
+        );
+        assert_eq!(
+            dtype_from_torch_str("torch.float8_e5m2").expect("fp8 e5m2"),
+            StDtype::F8_E5M2
+        );
+    }
+
+    #[test]
+    fn collect_tensor_layout_reports_offsets_and_metadata() {
+        let path = temp_path("layout", "safetensors");
+        write_test_safetensors(&path);
+
+        let (metadata, entries) = collect_tensor_layout(&path).expect("layout");
+        assert_eq!(metadata.get("family").map(String::as_str), Some("ltx2"));
+        assert_eq!(entries.len(), 2);
+
+        let weight = entries.iter().find(|entry| entry.name == "weight").expect("weight entry");
+        assert_eq!(weight.dtype, "F32");
+        assert_eq!(weight.shape, vec![2, 2]);
+        assert_eq!(weight.nbytes, 16);
+        assert!(weight.absolute_offsets.0 >= 8);
+        assert_eq!(
+            weight.absolute_offsets.1 - weight.absolute_offsets.0,
+            weight.data_offsets.1 - weight.data_offsets.0,
+        );
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn tensor_names_roundtrip() {
+        let path = temp_path("metadata", "safetensors");
+        write_test_safetensors(&path);
+
+        let names = tensor_names(&path).expect("tensor names");
+        assert_eq!(names, vec!["weight".to_string(), "bias".to_string()]);
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn shard_index_groups_weight_map_by_file() {
+        let path = temp_path("index", "json");
+        let payload = serde_json::json!({
+            "metadata": {"total_size": 1234},
+            "weight_map": {
+                "a.weight": "model-00001-of-00002.safetensors",
+                "b.weight": "model-00002-of-00002.safetensors",
+                "b.bias": "model-00002-of-00002.safetensors"
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&payload).expect("json bytes")).expect("write index");
+
+        let parsed = read_shard_index(&path).expect("read shard index");
+        let summary = summarize_shard_index(&parsed);
+        assert_eq!(
+            summary.metadata_numbers.get("total_size").copied(),
+            Some(1234)
+        );
+        assert_eq!(
+            summary
+                .weight_map
+                .get("a.weight")
+                .map(String::as_str),
+            Some("model-00001-of-00002.safetensors")
+        );
+        assert_eq!(
+            summary
+                .shards
+                .get("model-00002-of-00002.safetensors")
+                .cloned()
+                .unwrap_or_default(),
+            vec!["b.bias".to_string(), "b.weight".to_string()]
+        );
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn streaming_writer_roundtrips_metadata_and_layout() {
+        let path = temp_path("streaming", "safetensors");
+        let metadata = Some(HashMap::from([
+            ("family".to_string(), "ltx2".to_string()),
+            ("quant".to_string(), "eriquant".to_string()),
+        ]));
+        let tensors = vec![
+            (
+                "linear.weight".to_string(),
+                ByteView {
+                    dtype: StDtype::F32,
+                    shape: vec![2, 2],
+                    data: [1.0f32, 2.0, 3.0, 4.0]
+                        .into_iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                },
+            ),
+            (
+                "linear.bias".to_string(),
+                ByteView {
+                    dtype: StDtype::I16,
+                    shape: vec![2],
+                    data: [7i16, 8i16]
+                        .into_iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                },
+            ),
+        ];
+
+        let (header_len, header_bytes, tensors, _) =
+            prepare_write_plan(tensors.clone(), &metadata).expect("prepare");
+        write_standard_streaming(Path::new(&path), header_len, &header_bytes, &tensors)
+            .expect("write standard");
+
+        let file_bytes = fs::read(&path).expect("read file");
+        let parsed = SafeTensors::deserialize(&file_bytes).expect("deserialize");
+        assert_eq!(parsed.tensor("linear.weight").expect("weight").shape(), &[2, 2]);
+
+        let (layout_metadata, entries) = collect_tensor_layout(&path).expect("layout");
+        assert_eq!(layout_metadata.get("family").map(String::as_str), Some("ltx2"));
+        assert_eq!(layout_metadata.get("quant").map(String::as_str), Some("eriquant"));
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.absolute_offsets.1 > entry.absolute_offsets.0));
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn direct_streaming_writer_roundtrips() {
+        let path = temp_path("direct", "safetensors");
+        let tensors = vec![(
+            "tensor".to_string(),
+            ByteView {
+                dtype: StDtype::BF16,
+                shape: vec![4],
+                data: [1u16, 2u16, 3u16, 4u16]
+                    .into_iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            },
+        )];
+        let metadata = Some(HashMap::from([("step".to_string(), "42".to_string())]));
+
+        let (header_len, header_bytes, tensors, total_tensor_bytes) =
+            prepare_write_plan(tensors, &metadata).expect("prepare");
+        write_direct_streaming(
+            Path::new(&path),
+            header_len,
+            &header_bytes,
+            &tensors,
+            total_tensor_bytes,
+        )
+        .expect("write direct");
+
+        let file_bytes = fs::read(&path).expect("read file");
+        let parsed = SafeTensors::deserialize(&file_bytes).expect("deserialize");
+        assert_eq!(parsed.tensor("tensor").expect("tensor").dtype(), StDtype::BF16);
+        let (layout_metadata, _) = collect_tensor_layout(&path).expect("layout");
+        assert_eq!(layout_metadata.get("step").map(String::as_str), Some("42"));
+
+        fs::remove_file(path).ok();
+    }
 }

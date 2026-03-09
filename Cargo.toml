@@ -8,8 +8,12 @@ description = "High-performance safetensors I/O with O_DIRECT and mmap support f
 name = "serenity_safetensors"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22" }
 safetensors = "0.4"
 memmap2 = "0.9"
 serde_json = "1.0"
