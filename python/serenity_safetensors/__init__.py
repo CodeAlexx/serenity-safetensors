@@ -5,24 +5,37 @@ Drop-in replacement for safetensors.torch with training-optimized checkpoint sav
 
 Key features:
   - save_file_direct: O_DIRECT save, no page cache pollution, 4MB chunked writes
+  - streaming save path: no giant serialized output blob before write
   - load_file: lazy mmap views, no data copy until tensor accessed
   - load_selective / load_by_prefix: partial loading without materializing all tensors
+  - load_sharded / load_sharded_selective / load_sharded_by_prefix: multi-shard loading
+  - materialize_selective / materialize_by_prefix: subset writers for reduced source files
+  - materialize_sharded_selective / materialize_sharded_by_prefix: subset writers from sharded sources
   - file_metadata: header-only read, no tensor data touched
+  - tensor_layout / sharded_tensor_layout: Stagehand-friendly byte offsets
   - FP8 dtype support (float8_e4m3fn, float8_e5m2)
-  - Fast serialization via data_ptr+ctypes (numpy fallback)
 """
 
 from .serenity_safetensors import (
     save_file_direct,
     save_file,
+    materialize_selective,
+    materialize_by_prefix,
+    materialize_sharded_selective,
+    materialize_sharded_by_prefix,
     _load_file_raw,
     _load_selective_raw,
     _load_by_prefix_raw,
+    _load_sharded_raw,
+    _load_sharded_selective_raw,
+    _load_sharded_by_prefix_raw,
     file_metadata,
     tensor_layout,
     training_metadata,
     tensor_names,
     shard_index,
+    sharded_tensor_names,
+    sharded_tensor_layout,
 )
 
 
@@ -43,10 +56,15 @@ class SafeTensorsDict(dict):
         self._mmap = mmap_handle
 
     def close(self):
-        """Explicitly close the mmap. Tensors become invalid after this."""
-        if self._mmap is not None:
+        """Explicitly close backing mmaps. Tensors become invalid after this."""
+        if self._mmap is None:
+            return
+        if isinstance(self._mmap, (list, tuple)):
+            for handle in self._mmap:
+                handle.close()
+        else:
             self._mmap.close()
-            self._mmap = None
+        self._mmap = None
 
 
 def load_file(path, device="cpu"):
@@ -80,19 +98,46 @@ def load_by_prefix(path, prefix, device="cpu"):
     return SafeTensorsDict(tensor_dict, mmap_handle)
 
 
+def load_sharded(index_path, device="cpu"):
+    """Load all tensors referenced by a sharded safetensors index."""
+    tensor_dict, mmap_handles = _load_sharded_raw(index_path, device)
+    return SafeTensorsDict(tensor_dict, mmap_handles)
+
+
+def load_sharded_selective(index_path, names, device="cpu"):
+    """Load only the named tensors referenced by a sharded safetensors index."""
+    tensor_dict, mmap_handles = _load_sharded_selective_raw(index_path, names, device)
+    return SafeTensorsDict(tensor_dict, mmap_handles)
+
+
+def load_sharded_by_prefix(index_path, prefix, device="cpu"):
+    """Load prefix-matched tensors from a sharded safetensors index."""
+    tensor_dict, mmap_handles = _load_sharded_by_prefix_raw(index_path, prefix, device)
+    return SafeTensorsDict(tensor_dict, mmap_handles)
+
+
 from . import torch
 
 __all__ = [
     "save_file_direct",
     "save_file",
+    "materialize_selective",
+    "materialize_by_prefix",
+    "materialize_sharded_selective",
+    "materialize_sharded_by_prefix",
     "load_file",
     "load_selective",
     "load_by_prefix",
+    "load_sharded",
+    "load_sharded_selective",
+    "load_sharded_by_prefix",
     "file_metadata",
     "tensor_layout",
     "training_metadata",
     "tensor_names",
     "shard_index",
+    "sharded_tensor_names",
+    "sharded_tensor_layout",
     "SafeTensorsDict",
     "torch",
 ]

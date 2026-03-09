@@ -1,12 +1,14 @@
+use memmap2::MmapOptions;
 use pyo3::exceptions::{PyIOError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PySlice, PyTuple};
+use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
 use safetensors::tensor::{Dtype as StDtype, View};
+use safetensors::SafeTensors;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ── Error types ──────────────────────────────────────────────────────────────
 
@@ -237,6 +239,126 @@ fn summarize_shard_index(parsed: &serde_json::Value) -> ShardIndexSummary {
         weight_map,
         shards,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedShardSelection {
+    shard_name: String,
+    shard_path: String,
+    tensor_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShardedTensorLayoutEntry {
+    name: String,
+    shard_name: String,
+    shard_path: String,
+    dtype: String,
+    shape: Vec<usize>,
+    nbytes: usize,
+    data_offsets: (usize, usize),
+    absolute_offsets: (usize, usize),
+}
+
+fn resolve_shard_path(index_path: &str, shard_name: &str) -> String {
+    let shard_path = Path::new(shard_name);
+    if shard_path.is_absolute() {
+        return shard_path.to_string_lossy().into_owned();
+    }
+    let parent = Path::new(index_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    parent.join(shard_path).to_string_lossy().into_owned()
+}
+
+fn resolve_sharded_selections<F>(
+    index_path: &str,
+    summary: &ShardIndexSummary,
+    mut include: F,
+) -> Vec<ResolvedShardSelection>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut shard_names: Vec<String> = summary.shards.keys().cloned().collect();
+    shard_names.sort();
+
+    let mut resolved = Vec::new();
+    for shard_name in shard_names {
+        let mut tensor_names: Vec<String> = summary
+            .shards
+            .get(&shard_name)
+            .into_iter()
+            .flat_map(|names| names.iter())
+            .filter(|name| include(name))
+            .cloned()
+            .collect();
+        if tensor_names.is_empty() {
+            continue;
+        }
+        tensor_names.sort();
+        resolved.push(ResolvedShardSelection {
+            shard_path: resolve_shard_path(index_path, &shard_name),
+            shard_name,
+            tensor_names,
+        });
+    }
+
+    resolved
+}
+
+fn collect_sharded_tensor_layout(
+    index_path: &str,
+) -> Result<
+    (
+        ShardIndexSummary,
+        HashMap<String, String>,
+        HashMap<String, HashMap<String, String>>,
+        Vec<ShardedTensorLayoutEntry>,
+    ),
+    SsError,
+> {
+    let parsed = read_shard_index(index_path)?;
+    let summary = summarize_shard_index(&parsed);
+    let selections = resolve_sharded_selections(index_path, &summary, |_| true);
+
+    let mut shard_paths = HashMap::new();
+    let mut shard_metadata = HashMap::new();
+    let mut tensors = Vec::new();
+
+    for selection in selections {
+        let (metadata, entries) = collect_tensor_layout(&selection.shard_path)?;
+        let expected: HashSet<&str> = selection.tensor_names.iter().map(String::as_str).collect();
+        let mut found = 0usize;
+
+        shard_paths.insert(selection.shard_name.clone(), selection.shard_path.clone());
+        shard_metadata.insert(selection.shard_name.clone(), metadata);
+
+        for entry in entries {
+            if expected.contains(entry.name.as_str()) {
+                found += 1;
+                tensors.push(ShardedTensorLayoutEntry {
+                    name: entry.name,
+                    shard_name: selection.shard_name.clone(),
+                    shard_path: selection.shard_path.clone(),
+                    dtype: entry.dtype,
+                    shape: entry.shape,
+                    nbytes: entry.nbytes,
+                    data_offsets: entry.data_offsets,
+                    absolute_offsets: entry.absolute_offsets,
+                });
+            }
+        }
+
+        if found != expected.len() {
+            return Err(SsError::Other(format!(
+                "Shard {} is missing one or more indexed tensors",
+                selection.shard_name
+            )));
+        }
+    }
+
+    Ok((summary, shard_paths, shard_metadata, tensors))
 }
 
 // ── Streaming write helpers ─────────────────────────────────────────────────
@@ -521,6 +643,110 @@ fn write_direct_streaming<V: View>(
     write_standard_streaming(path, header_len, header_bytes, tensors)
 }
 
+fn materialize_single_file_selection<F>(
+    input_path: &str,
+    output_path: &str,
+    direct: bool,
+    mut include: F,
+) -> Result<usize, SsError>
+where
+    F: FnMut(&str) -> bool,
+{
+    let (metadata, _) = collect_tensor_layout(input_path)?;
+    let file = fs::File::open(input_path)?;
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let tensors = SafeTensors::deserialize(&mmap)?;
+
+    let mut selected = Vec::new();
+    for name in tensors.names() {
+        if include(name) {
+            selected.push((name.clone(), tensors.tensor(name)?));
+        }
+    }
+
+    let selected_count = selected.len();
+    let metadata = if metadata.is_empty() { None } else { Some(metadata) };
+    let (header_len, header_bytes, selected, total_tensor_bytes) =
+        prepare_write_plan(selected, &metadata)?;
+    if direct {
+        write_direct_streaming(
+            Path::new(output_path),
+            header_len,
+            &header_bytes,
+            &selected,
+            total_tensor_bytes,
+        )?;
+    } else {
+        write_standard_streaming(Path::new(output_path), header_len, &header_bytes, &selected)?;
+    }
+
+    Ok(selected_count)
+}
+
+fn materialize_sharded_selection<F>(
+    index_path: &str,
+    output_path: &str,
+    direct: bool,
+    mut include: F,
+) -> Result<usize, SsError>
+where
+    F: FnMut(&str) -> bool,
+{
+    let (summary, _, shard_metadata, _) = collect_sharded_tensor_layout(index_path)?;
+    let selections = resolve_sharded_selections(index_path, &summary, |name| include(name));
+
+    let mut metadata = HashMap::new();
+    for selection in &selections {
+        if let Some(shard_meta) = shard_metadata.get(&selection.shard_name) {
+            if metadata.is_empty() && !shard_meta.is_empty() {
+                metadata = shard_meta.clone();
+            }
+        }
+    }
+    for (k, v) in &summary.metadata_strings {
+        metadata.entry(k.clone()).or_insert(v.clone());
+    }
+    for (k, v) in &summary.metadata_numbers {
+        metadata.entry(k.clone()).or_insert(v.to_string());
+    }
+
+    let mut mmaps = Vec::with_capacity(selections.len());
+    for selection in &selections {
+        let file = fs::File::open(&selection.shard_path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        mmaps.push(mmap);
+    }
+
+    let mut selected = Vec::new();
+    for (selection, mmap) in selections.iter().zip(mmaps.iter()) {
+        let tensors = SafeTensors::deserialize(mmap)?;
+        let requested: HashSet<&str> = selection.tensor_names.iter().map(String::as_str).collect();
+        for name in tensors.names() {
+            if requested.contains(name.as_str()) {
+                selected.push((name.clone(), tensors.tensor(name)?));
+            }
+        }
+    }
+
+    let selected_count = selected.len();
+    let metadata = if metadata.is_empty() { None } else { Some(metadata) };
+    let (header_len, header_bytes, selected, total_tensor_bytes) =
+        prepare_write_plan(selected, &metadata)?;
+    if direct {
+        write_direct_streaming(
+            Path::new(output_path),
+            header_len,
+            &header_bytes,
+            &selected,
+            total_tensor_bytes,
+        )?;
+    } else {
+        write_standard_streaming(Path::new(output_path), header_len, &header_bytes, &selected)?;
+    }
+
+    Ok(selected_count)
+}
+
 // ── Load via Python mmap (lazy, zero-copy views) ────────────────────────────
 //
 // Strategy: use Python's mmap module so the mmap object lives in Python's heap.
@@ -634,6 +860,50 @@ fn memview_slice_to_tensor(
     }
 }
 
+fn open_readonly_mmap(py: Python<'_>, path: &str) -> PyResult<Py<PyAny>> {
+    let mmap_mod = py.import_bound("mmap")?;
+    let builtins = py.import_bound("builtins")?;
+
+    let file = builtins.call_method1("open", (path, "rb"))?;
+    let fileno = file.call_method0("fileno")?;
+    let mmap_kwargs = PyDict::new_bound(py);
+    mmap_kwargs.set_item("access", mmap_mod.getattr("ACCESS_READ")?)?;
+    let py_mmap = mmap_mod.call_method("mmap", (fileno, 0i64), Some(&mmap_kwargs))?;
+    file.call_method0("close")?;
+    Ok(py_mmap.unbind())
+}
+
+fn load_selected_tensors_from_mmap(
+    py: Python<'_>,
+    py_mmap: &Bound<'_, PyAny>,
+    requested_names: &HashSet<&str>,
+    device: &str,
+    result: &Bound<'_, PyDict>,
+) -> PyResult<()> {
+    let builtins = py.import_bound("builtins")?;
+    let torch = py.import_bound("torch")?;
+    let (tensors, data_start) = parse_tensor_layout(py, py_mmap)?;
+    let memview = builtins.call_method1("memoryview", (py_mmap,))?;
+
+    for (name, dtype, shape, start, end) in &tensors {
+        if requested_names.contains(name.as_str()) {
+            let tensor = memview_slice_to_tensor(
+                py,
+                &torch,
+                &memview,
+                dtype,
+                shape,
+                data_start + start,
+                data_start + end,
+                device,
+            )?;
+            result.set_item(name, tensor)?;
+        }
+    }
+
+    Ok(())
+}
+
 // ── Python-exposed functions ────────────────────────────────────────────────
 
 /// Save a state_dict using O_DIRECT — no page cache pollution.
@@ -671,6 +941,60 @@ fn save_file(
     let (header_len, header_bytes, views, _) = prepare_write_plan(views, &metadata)?;
     write_standard_streaming(Path::new(path), header_len, &header_bytes, &views)?;
     Ok(())
+}
+
+/// Write a new safetensors file containing only the named tensors from a source file.
+#[pyfunction]
+#[pyo3(signature = (path, output_path, names, direct=false))]
+fn materialize_selective(
+    path: &str,
+    output_path: &str,
+    names: Vec<String>,
+    direct: bool,
+) -> PyResult<usize> {
+    let requested: HashSet<&str> = names.iter().map(String::as_str).collect();
+    materialize_single_file_selection(path, output_path, direct, |name| requested.contains(name))
+        .map_err(PyErr::from)
+}
+
+/// Write a new safetensors file containing only tensors matching a prefix.
+#[pyfunction]
+#[pyo3(signature = (path, output_path, prefix, direct=false))]
+fn materialize_by_prefix(
+    path: &str,
+    output_path: &str,
+    prefix: &str,
+    direct: bool,
+) -> PyResult<usize> {
+    materialize_single_file_selection(path, output_path, direct, |name| name.starts_with(prefix))
+        .map_err(PyErr::from)
+}
+
+/// Write a new safetensors file containing only the named tensors from a sharded index.
+#[pyfunction]
+#[pyo3(signature = (index_path, output_path, names, direct=false))]
+fn materialize_sharded_selective(
+    index_path: &str,
+    output_path: &str,
+    names: Vec<String>,
+    direct: bool,
+) -> PyResult<usize> {
+    let requested: HashSet<&str> = names.iter().map(String::as_str).collect();
+    materialize_sharded_selection(index_path, output_path, direct, |name| requested.contains(name))
+        .map_err(PyErr::from)
+}
+
+/// Write a new safetensors file containing only prefix-matched tensors from a sharded index.
+#[pyfunction]
+#[pyo3(signature = (index_path, output_path, prefix, direct=false))]
+fn materialize_sharded_by_prefix(
+    index_path: &str,
+    output_path: &str,
+    prefix: &str,
+    direct: bool,
+) -> PyResult<usize> {
+    materialize_sharded_selection(index_path, output_path, direct, |name| name.starts_with(prefix))
+        .map_err(PyErr::from)
 }
 
 /// Load all tensors from a safetensors file. Returns (dict, mmap_handle).
@@ -796,6 +1120,87 @@ fn _load_by_prefix_raw(
     }
 
     let ret = PyTuple::new_bound(py, &[result.as_any(), py_mmap.as_any()]);
+    Ok(ret.into())
+}
+
+/// Load all tensors referenced by a sharded safetensors index.
+#[pyfunction]
+#[pyo3(signature = (index_path, device="cpu"))]
+fn _load_sharded_raw(py: Python<'_>, index_path: &str, device: &str) -> PyResult<PyObject> {
+    let parsed = read_shard_index(index_path)?;
+    let summary = summarize_shard_index(&parsed);
+    let selections = resolve_sharded_selections(index_path, &summary, |_| true);
+
+    let result = PyDict::new_bound(py);
+    let handles = PyList::empty_bound(py);
+    for selection in selections {
+        let py_mmap = open_readonly_mmap(py, &selection.shard_path)?;
+        let bound = py_mmap.bind(py);
+        let requested: HashSet<&str> = selection.tensor_names.iter().map(String::as_str).collect();
+        load_selected_tensors_from_mmap(py, bound, &requested, device, &result)?;
+        handles.append(py_mmap)?;
+    }
+
+    let ret = PyTuple::new_bound(py, &[result.as_any(), handles.as_any()]);
+    Ok(ret.into())
+}
+
+/// Load selected tensors by name from a sharded safetensors index.
+#[pyfunction]
+#[pyo3(signature = (index_path, names, device="cpu"))]
+fn _load_sharded_selective_raw(
+    py: Python<'_>,
+    index_path: &str,
+    names: Vec<String>,
+    device: &str,
+) -> PyResult<PyObject> {
+    let parsed = read_shard_index(index_path)?;
+    let summary = summarize_shard_index(&parsed);
+    let requested: HashSet<&str> = names.iter().map(String::as_str).collect();
+    let selections =
+        resolve_sharded_selections(index_path, &summary, |name| requested.contains(name));
+
+    let result = PyDict::new_bound(py);
+    let handles = PyList::empty_bound(py);
+    for selection in selections {
+        let py_mmap = open_readonly_mmap(py, &selection.shard_path)?;
+        let bound = py_mmap.bind(py);
+        let selection_names: HashSet<&str> =
+            selection.tensor_names.iter().map(String::as_str).collect();
+        load_selected_tensors_from_mmap(py, bound, &selection_names, device, &result)?;
+        handles.append(py_mmap)?;
+    }
+
+    let ret = PyTuple::new_bound(py, &[result.as_any(), handles.as_any()]);
+    Ok(ret.into())
+}
+
+/// Load tensors matching a prefix from a sharded safetensors index.
+#[pyfunction]
+#[pyo3(signature = (index_path, prefix, device="cpu"))]
+fn _load_sharded_by_prefix_raw(
+    py: Python<'_>,
+    index_path: &str,
+    prefix: &str,
+    device: &str,
+) -> PyResult<PyObject> {
+    let parsed = read_shard_index(index_path)?;
+    let summary = summarize_shard_index(&parsed);
+    let selections =
+        resolve_sharded_selections(index_path, &summary, |name| name.starts_with(prefix));
+
+    let result = PyDict::new_bound(py);
+    let handles = PyList::empty_bound(py);
+    for selection in selections {
+        let py_mmap = open_readonly_mmap(py, &selection.shard_path)?;
+        let bound = py_mmap.bind(py);
+        let selection_names: HashSet<&str> =
+            selection.tensor_names.iter().map(String::as_str).collect();
+        load_selected_tensors_from_mmap(py, bound, &selection_names, device, &result)?;
+        handles.append(py_mmap)?;
+    }
+
+    let ret = PyTuple::new_bound(py, &[result.as_any(), handles.as_any()]);
     Ok(ret.into())
 }
 
@@ -940,27 +1345,107 @@ fn shard_index(py: Python<'_>, path: &str) -> PyResult<PyObject> {
     Ok(result.into())
 }
 
+/// List tensor names in a sharded safetensors index without opening shard data.
+#[pyfunction]
+fn sharded_tensor_names(index_path: &str) -> PyResult<Vec<String>> {
+    let parsed = read_shard_index(index_path)?;
+    let summary = summarize_shard_index(&parsed);
+    let mut names: Vec<String> = summary.weight_map.keys().cloned().collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Return tensor layout across all shards with resolved shard paths and offsets.
+#[pyfunction]
+fn sharded_tensor_layout(py: Python<'_>, index_path: &str) -> PyResult<PyObject> {
+    let (summary, shard_paths, shard_metadata, entries) = collect_sharded_tensor_layout(index_path)?;
+    let result = PyDict::new_bound(py);
+    result.set_item("index_path", index_path)?;
+
+    let metadata_dict = PyDict::new_bound(py);
+    for (k, v) in &summary.metadata_strings {
+        metadata_dict.set_item(k, v)?;
+    }
+    for (k, v) in &summary.metadata_numbers {
+        metadata_dict.set_item(k, v)?;
+    }
+    result.set_item("metadata", metadata_dict)?;
+
+    let shards_dict = PyDict::new_bound(py);
+    let mut shard_names: Vec<String> = shard_paths.keys().cloned().collect();
+    shard_names.sort();
+    for shard_name in shard_names {
+        let item = PyDict::new_bound(py);
+        if let Some(path) = shard_paths.get(&shard_name) {
+            item.set_item("path", path)?;
+        }
+        let shard_meta = PyDict::new_bound(py);
+        if let Some(metadata) = shard_metadata.get(&shard_name) {
+            for (k, v) in metadata {
+                shard_meta.set_item(k, v)?;
+            }
+        }
+        item.set_item("metadata", shard_meta)?;
+        shards_dict.set_item(&shard_name, item)?;
+    }
+    result.set_item("shards", shards_dict)?;
+
+    let tensors_dict = PyDict::new_bound(py);
+    for entry in &entries {
+        let item = PyDict::new_bound(py);
+        let shape: Vec<u64> = entry.shape.iter().map(|&n| n as u64).collect();
+        item.set_item("shard", &entry.shard_name)?;
+        item.set_item("path", &entry.shard_path)?;
+        item.set_item("dtype", &entry.dtype)?;
+        item.set_item("shape", shape)?;
+        item.set_item("nbytes", entry.nbytes as u64)?;
+        item.set_item(
+            "data_offsets",
+            (entry.data_offsets.0 as u64, entry.data_offsets.1 as u64),
+        )?;
+        item.set_item(
+            "absolute_offsets",
+            (
+                entry.absolute_offsets.0 as u64,
+                entry.absolute_offsets.1 as u64,
+            ),
+        )?;
+        tensors_dict.set_item(&entry.name, item)?;
+    }
+    result.set_item("tensors", tensors_dict)?;
+
+    Ok(result.into())
+}
+
 // ── Module definition ───────────────────────────────────────────────────────
 
 #[pymodule]
 fn serenity_safetensors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(save_file_direct, m)?)?;
     m.add_function(wrap_pyfunction!(save_file, m)?)?;
+    m.add_function(wrap_pyfunction!(materialize_selective, m)?)?;
+    m.add_function(wrap_pyfunction!(materialize_by_prefix, m)?)?;
+    m.add_function(wrap_pyfunction!(materialize_sharded_selective, m)?)?;
+    m.add_function(wrap_pyfunction!(materialize_sharded_by_prefix, m)?)?;
     m.add_function(wrap_pyfunction!(_load_file_raw, m)?)?;
     m.add_function(wrap_pyfunction!(_load_selective_raw, m)?)?;
     m.add_function(wrap_pyfunction!(_load_by_prefix_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(_load_sharded_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(_load_sharded_selective_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(_load_sharded_by_prefix_raw, m)?)?;
     m.add_function(wrap_pyfunction!(file_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_layout, m)?)?;
     m.add_function(wrap_pyfunction!(training_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_names, m)?)?;
     m.add_function(wrap_pyfunction!(shard_index, m)?)?;
+    m.add_function(wrap_pyfunction!(sharded_tensor_names, m)?)?;
+    m.add_function(wrap_pyfunction!(sharded_tensor_layout, m)?)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use safetensors::tensor::TensorView;
     use safetensors::{serialize, SafeTensors};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1002,30 +1487,113 @@ mod tests {
     }
 
     fn write_test_safetensors(path: &str) {
-        let weight_data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
-            .into_iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let bias_data: Vec<u8> = [5i8, 6i8, 7i8]
-            .into_iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let metadata = HashMap::from([
+        let metadata = Some(HashMap::from([
             ("family".to_string(), "ltx2".to_string()),
             ("step".to_string(), "3".to_string()),
-        ]);
+        ]));
         let views = vec![
             (
                 "weight".to_string(),
-                TensorView::new(StDtype::F32, vec![2, 2], &weight_data).expect("weight view"),
+                ByteView {
+                    dtype: StDtype::F32,
+                    shape: vec![2, 2],
+                    data: [1.0f32, 2.0, 3.0, 4.0]
+                        .into_iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                },
             ),
             (
                 "bias".to_string(),
-                TensorView::new(StDtype::I8, vec![3], &bias_data).expect("bias view"),
+                ByteView {
+                    dtype: StDtype::I8,
+                    shape: vec![3],
+                    data: [5i8, 6i8, 7i8]
+                        .into_iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                },
             ),
         ];
-        let serialized = serialize(views, &Some(metadata)).expect("serialize");
+        write_byte_view_safetensors(path, metadata, views);
+    }
+
+    fn write_byte_view_safetensors(
+        path: &str,
+        metadata: Option<HashMap<String, String>>,
+        views: Vec<(String, ByteView)>,
+    ) {
+        let serialized = serialize(views, &metadata).expect("serialize");
         fs::write(path, serialized).expect("write test safetensors");
+    }
+
+    fn write_sharded_fixture() -> (String, String) {
+        let dir = temp_path("sharded", "dir");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let shard_one = Path::new(&dir).join("model-00001-of-00002.safetensors");
+        let shard_two = Path::new(&dir).join("model-00002-of-00002.safetensors");
+        let index_path = Path::new(&dir).join("model.safetensors.index.json");
+
+        write_byte_view_safetensors(
+            shard_one.to_string_lossy().as_ref(),
+            Some(HashMap::from([("family".to_string(), "ltx2".to_string())])),
+            vec![(
+                "a.weight".to_string(),
+                ByteView {
+                    dtype: StDtype::F32,
+                    shape: vec![2],
+                    data: [11.0f32, 12.0f32]
+                        .into_iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect(),
+                },
+            )],
+        );
+
+        write_byte_view_safetensors(
+            shard_two.to_string_lossy().as_ref(),
+            Some(HashMap::from([("family".to_string(), "ltx2".to_string())])),
+            vec![
+                (
+                    "b.weight".to_string(),
+                    ByteView {
+                        dtype: StDtype::BF16,
+                        shape: vec![2],
+                        data: [1u16, 2u16]
+                            .into_iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                    },
+                ),
+                (
+                    "b.bias".to_string(),
+                    ByteView {
+                        dtype: StDtype::I16,
+                        shape: vec![2],
+                        data: [3i16, 4i16]
+                            .into_iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                    },
+                ),
+            ],
+        );
+
+        let payload = serde_json::json!({
+            "metadata": {"total_size": 20, "format": "pt"},
+            "weight_map": {
+                "a.weight": "model-00001-of-00002.safetensors",
+                "b.weight": "model-00002-of-00002.safetensors",
+                "b.bias": "model-00002-of-00002.safetensors"
+            }
+        });
+        fs::write(&index_path, serde_json::to_vec(&payload).expect("json bytes")).expect("write index");
+
+        (
+            dir,
+            index_path.to_string_lossy().into_owned(),
+        )
     }
 
     #[test]
@@ -1113,6 +1681,62 @@ mod tests {
     }
 
     #[test]
+    fn sharded_tensor_layout_resolves_relative_shards() {
+        let (dir, index_path) = write_sharded_fixture();
+        let expected_shard_one = Path::new(&dir)
+            .join("model-00001-of-00002.safetensors")
+            .to_string_lossy()
+            .into_owned();
+
+        let (summary, shard_paths, shard_metadata, entries) =
+            collect_sharded_tensor_layout(&index_path).expect("sharded layout");
+        assert_eq!(
+            summary.metadata_numbers.get("total_size").copied(),
+            Some(20)
+        );
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            shard_paths
+                .get("model-00001-of-00002.safetensors")
+                .map(String::as_str),
+            Some(expected_shard_one.as_str())
+        );
+        assert_eq!(
+            shard_metadata
+                .get("model-00002-of-00002.safetensors")
+                .and_then(|md| md.get("family"))
+                .map(String::as_str),
+            Some("ltx2")
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            vec!["a.weight", "b.weight", "b.bias"]
+        );
+        assert!(entries.iter().all(|entry| entry.absolute_offsets.0 >= 8));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn resolve_sharded_selections_filters_prefix() {
+        let (_, index_path) = write_sharded_fixture();
+        let parsed = read_shard_index(&index_path).expect("read shard index");
+        let summary = summarize_shard_index(&parsed);
+
+        let selections =
+            resolve_sharded_selections(&index_path, &summary, |name| name.starts_with("b."));
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].shard_name, "model-00002-of-00002.safetensors");
+        assert_eq!(
+            selections[0].tensor_names,
+            vec!["b.bias".to_string(), "b.weight".to_string()]
+        );
+
+        let parent = Path::new(&index_path).parent().expect("index parent");
+        fs::remove_dir_all(parent).ok();
+    }
+
+    #[test]
     fn streaming_writer_roundtrips_metadata_and_layout() {
         let path = temp_path("streaming", "safetensors");
         let metadata = Some(HashMap::from([
@@ -1196,5 +1820,47 @@ mod tests {
         assert_eq!(layout_metadata.get("step").map(String::as_str), Some("42"));
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn materialize_selective_writes_subset_file() {
+        let source = temp_path("materialize_source", "safetensors");
+        let output = temp_path("materialize_subset", "safetensors");
+        write_test_safetensors(&source);
+
+        let written = materialize_single_file_selection(&source, &output, false, |name| name == "bias")
+            .expect("materialize selective");
+        assert_eq!(written, 1);
+
+        let names = tensor_names(&output).expect("subset names");
+        assert_eq!(names, vec!["bias".to_string()]);
+        let (metadata, entries) = collect_tensor_layout(&output).expect("subset layout");
+        assert_eq!(metadata.get("family").map(String::as_str), Some("ltx2"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "bias");
+
+        fs::remove_file(source).ok();
+        fs::remove_file(output).ok();
+    }
+
+    #[test]
+    fn materialize_sharded_by_prefix_writes_subset_file() {
+        let (dir, index_path) = write_sharded_fixture();
+        let output = temp_path("materialize_sharded_subset", "safetensors");
+
+        let written =
+            materialize_sharded_selection(&index_path, &output, false, |name| name.starts_with("b."))
+                .expect("materialize sharded prefix");
+        assert_eq!(written, 2);
+
+        let names = tensor_names(&output).expect("subset names");
+        assert_eq!(names, vec!["b.weight".to_string(), "b.bias".to_string()]);
+        let (metadata, entries) = collect_tensor_layout(&output).expect("subset layout");
+        assert_eq!(metadata.get("family").map(String::as_str), Some("ltx2"));
+        assert_eq!(metadata.get("total_size").map(String::as_str), Some("20"));
+        assert_eq!(entries.len(), 2);
+
+        fs::remove_dir_all(dir).ok();
+        fs::remove_file(output).ok();
     }
 }

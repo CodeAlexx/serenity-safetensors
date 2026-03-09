@@ -69,7 +69,7 @@ Why it matters:
 
 ## Phase 3: Sharded Source Access
 
-Status: next
+Status: completed
 
 Deliverables:
 
@@ -87,7 +87,7 @@ Tests:
 
 ## Phase 4: Subset Materialization
 
-Status: next
+Status: completed
 
 Deliverables:
 
