@@ -337,8 +337,6 @@ All roadmap phases are complete. The package is fully adopted in the Serenity tr
 - source manifest resolution (Stagehand source resolver)
 - persisted EriQuant frozen base reuse (eriquant_stagehand.py)
 
-Detailed implementation phases are tracked in [ROADMAP.md](ROADMAP.md).
-
 ## How the loading works
 
 ```
