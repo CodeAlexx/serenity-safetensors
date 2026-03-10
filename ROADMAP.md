@@ -29,12 +29,9 @@ Implemented now:
 - streaming `save_file_direct` with `O_DIRECT` fallback
 - Rust unit coverage for layout, shard index, and streaming writes
 
-Current gap:
+Remaining gap:
 
-- no sharded tensor reader yet, only shard-index inspection
-- no subset/materialization writer
-- no persisted quantized container for `EriQuant`
-- metadata schema is still checkpoint-oriented, not source-manifest-oriented
+- Serenity-side adoption (Phase 7) not started yet
 
 ## Phase 1: Stable Inspection Surface
 
