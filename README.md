@@ -39,6 +39,8 @@ Standard `safetensors.torch.save_file` writes through the page cache. A 4GB chec
 | No Stagehand-friendly layout API | `tensor_layout` returns dtype, shape, logical offsets, and absolute byte offsets |
 | No shard index parser | `shard_index` reads diffusers safetensors index files and groups tensors by shard |
 | No sharded layout inspection | `sharded_tensor_layout` resolves shard paths and per-tensor offsets across the full index |
+| No reusable source manifest layer | `source_manifest`, `quantized_source_manifest`, `read_manifest`, `write_manifest`, and `check_manifest_compatibility` |
+| No quantized artifact verifier | `read_quantized_block_map`, `write_quantized_block_map`, and `verify_quantized_manifest_artifacts` |
 | No FP8 support | F8_E4M3 (`float8_e4m3fn`) and F8_E5M2 (`float8_e5m2`) |
 | Save path builds one big output blob | `save_file` / `save_file_direct` stream header + tensor payloads incrementally |
 
@@ -141,6 +143,70 @@ materialize_sharded_by_prefix(
 )
 ```
 
+### Source manifests
+
+```python
+from serenity_safetensors.torch import (
+    source_manifest,
+    quantized_source_manifest,
+    write_manifest,
+    read_manifest,
+    check_manifest_compatibility,
+    write_quantized_block_map,
+    read_quantized_block_map,
+    verify_quantized_manifest_artifacts,
+)
+
+manifest = source_manifest(
+    model_family="ltx2_19b",
+    model_version="2.3",
+    source_kind="materialized_subset",
+    source_path="transformer_only.safetensors",
+    original_source="hf://Lightricks/LTX-2.3-distilled",
+    source_signature="sha256:base123",
+    dtype="bfloat16",
+    tensor_prefixes=["transformer."],
+    stagehand_layout="transformer_blocks_v1",
+)
+write_manifest("transformer_only.source.json", manifest)
+
+quant_manifest = quantized_source_manifest(
+    model_family="ltx2_19b",
+    model_version="2.3",
+    original_source="hf://Lightricks/LTX-2.3-distilled",
+    source_signature="sha256:base123",
+    block_map_path="blocks.json",
+    data_files=["block_000.bin", "block_001.bin"],
+    source_path="eriquant_cache",
+    quant_mode="eriquant",
+    tensor_prefixes=["transformer."],
+    block_count=4128,
+    group_size=64,
+    stagehand_layout="transformer_blocks_v1",
+)
+write_manifest("eriquant.source.json", quant_manifest)
+
+loaded = read_manifest("eriquant.source.json")
+compat = check_manifest_compatibility(
+    "eriquant.source.json",
+    model_family="ltx2_19b",
+    model_version="2.3",
+    source_signature="sha256:base123",
+    quant_mode="eriquant",
+    stagehand_layout="transformer_blocks_v1",
+)
+assert compat["ok"]
+
+write_quantized_block_map("blocks.json", {
+    "blocks": [
+        {"file": "block_000.bin", "offset": 0, "nbytes": 4096, "tensors": ["transformer.blocks.0.attn.qkv.weight"]},
+    ],
+})
+block_map = read_quantized_block_map("blocks.json")
+verify = verify_quantized_manifest_artifacts("eriquant.source.json")
+assert verify["ok"]
+```
+
 ### Inspect without loading data
 
 ```python
@@ -186,6 +252,14 @@ print(layout["tensors"]["transformer.blocks.0.attn.qkv.weight"]["path"])
 | `materialize_by_prefix(path, output_path, prefix, direct=False)` | Write a subset file from a prefix |
 | `materialize_sharded_selective(index_path, output_path, names, direct=False)` | Write a subset file from a sharded index by tensor name |
 | `materialize_sharded_by_prefix(index_path, output_path, prefix, direct=False)` | Write a subset file from a sharded index by prefix |
+| `source_manifest(...)` | Build a canonical Serenity source manifest |
+| `quantized_source_manifest(...)` | Build a canonical Serenity quantized-source manifest |
+| `read_manifest(path, resolve_paths=True)` | Read and validate a source manifest |
+| `write_manifest(path, manifest)` | Validate and write a source manifest |
+| `check_manifest_compatibility(path, ...)` | Check model/source/quant/Stagehand compatibility against a manifest |
+| `read_quantized_block_map(path, resolve_paths=True)` | Read and validate a quantized block-map file |
+| `write_quantized_block_map(path, block_map)` | Validate and write a quantized block-map file |
+| `verify_quantized_manifest_artifacts(path)` | Verify that a quantized-source manifest matches its block map and data files |
 | `load_file(path, device="cpu")` | Lazy mmap load, memoryview zero-copy (drop-in, 4x faster) |
 | `load_selective(path, names, device="cpu")` | Load only named tensors |
 | `load_by_prefix(path, prefix, device="cpu")` | Load prefix-matched tensors |
@@ -212,6 +286,9 @@ Current Rust verification covers:
 - prefix-based shard selection resolution
 - single-file subset materialization
 - sharded subset materialization
+- source-manifest read/write/normalize helpers
+- quantized-source manifest generation and compatibility checks
+- quantized block-map read/write and artifact verification
 - normal streaming safetensors writes
 - direct/O_DIRECT streaming safetensors writes
 

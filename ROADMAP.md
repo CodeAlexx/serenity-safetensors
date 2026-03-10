@@ -111,7 +111,7 @@ Tests:
 
 ## Phase 5: Source Manifests
 
-Status: planned
+Status: completed
 
 Deliverables:
 
@@ -125,6 +125,13 @@ Deliverables:
   - compatibility/version markers
 - manifest read/write helpers
 
+Implemented:
+
+- canonical `source_manifest` and `quantized_source_manifest` builders
+- `read_manifest` / `write_manifest`
+- manifest path resolution for relative artifact/source paths
+- manifest compatibility checks for model/version/signature/quant mode/Stagehand layout
+
 Why it matters:
 
 - Stagehand and training adapters need to know what a source actually is before loading it.
@@ -132,13 +139,27 @@ Why it matters:
 
 ## Phase 6: Persisted Quantized Sources
 
-Status: planned
+Status: in progress
 
 Deliverables:
 
 - persisted `EriQuant` frozen block sources in Serenity-owned format
 - block map metadata compatible with Stagehand scheduling
 - source signatures so quantized caches can be reused safely across runs
+
+Implemented so far:
+
+- quantized-source manifest schema
+- block-map and data-file metadata in manifests
+- compatibility/signature checks for quantized manifests
+- quantized block-map read/write helpers
+- artifact verification against block-map/data-file declarations
+
+Still missing:
+
+- actual Serenity-owned persisted quant-block container format
+- deterministic block-map validation against on-disk payloads
+- reload helpers for quantized block sources
 
 Why it matters:
 

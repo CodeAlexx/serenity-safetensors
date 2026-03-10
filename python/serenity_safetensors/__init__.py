@@ -11,6 +11,9 @@ Key features:
   - load_sharded / load_sharded_selective / load_sharded_by_prefix: multi-shard loading
   - materialize_selective / materialize_by_prefix: subset writers for reduced source files
   - materialize_sharded_selective / materialize_sharded_by_prefix: subset writers from sharded sources
+  - source_manifest / quantized_source_manifest: canonical Serenity source-manifest builders
+  - read_manifest / write_manifest / check_manifest_compatibility: manifest persistence and checks
+  - read_quantized_block_map / write_quantized_block_map / verify_quantized_manifest_artifacts: quantized payload validation
   - file_metadata: header-only read, no tensor data touched
   - tensor_layout / sharded_tensor_layout: Stagehand-friendly byte offsets
   - FP8 dtype support (float8_e4m3fn, float8_e5m2)
@@ -19,6 +22,14 @@ Key features:
 from .serenity_safetensors import (
     save_file_direct,
     save_file,
+    source_manifest,
+    quantized_source_manifest,
+    read_manifest,
+    write_manifest,
+    check_manifest_compatibility,
+    read_quantized_block_map,
+    write_quantized_block_map,
+    verify_quantized_manifest_artifacts,
     materialize_selective,
     materialize_by_prefix,
     materialize_sharded_selective,
@@ -121,6 +132,14 @@ from . import torch
 __all__ = [
     "save_file_direct",
     "save_file",
+    "source_manifest",
+    "quantized_source_manifest",
+    "read_manifest",
+    "write_manifest",
+    "check_manifest_compatibility",
+    "read_quantized_block_map",
+    "write_quantized_block_map",
+    "verify_quantized_manifest_artifacts",
     "materialize_selective",
     "materialize_by_prefix",
     "materialize_sharded_selective",

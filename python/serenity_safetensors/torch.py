@@ -8,6 +8,12 @@ With:
 
 Additional:
     save_file_direct  — O_DIRECT checkpoint save (4MB chunked, no page cache)
+    source_manifest — build a canonical Serenity source manifest
+    quantized_source_manifest — build a canonical Serenity quantized-source manifest
+    read_manifest / write_manifest — persist and reload source manifests
+    check_manifest_compatibility — verify manifest/runtime compatibility
+    read_quantized_block_map / write_quantized_block_map — persist and reload quantized block maps
+    verify_quantized_manifest_artifacts — verify quantized payload consistency
     materialize_selective — write a subset file by explicit tensor names
     materialize_by_prefix — write a subset file by prefix
     materialize_sharded_selective — subset materialization from a sharded index
@@ -25,6 +31,14 @@ Additional:
 from . import (
     save_file_direct,
     save_file,
+    source_manifest,
+    quantized_source_manifest,
+    read_manifest,
+    write_manifest,
+    check_manifest_compatibility,
+    read_quantized_block_map,
+    write_quantized_block_map,
+    verify_quantized_manifest_artifacts,
     materialize_selective,
     materialize_by_prefix,
     materialize_sharded_selective,
@@ -47,6 +61,14 @@ from . import (
 __all__ = [
     "save_file_direct",
     "save_file",
+    "source_manifest",
+    "quantized_source_manifest",
+    "read_manifest",
+    "write_manifest",
+    "check_manifest_compatibility",
+    "read_quantized_block_map",
+    "write_quantized_block_map",
+    "verify_quantized_manifest_artifacts",
     "materialize_selective",
     "materialize_by_prefix",
     "materialize_sharded_selective",

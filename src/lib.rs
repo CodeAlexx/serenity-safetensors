@@ -260,6 +260,11 @@ struct ShardedTensorLayoutEntry {
     absolute_offsets: (usize, usize),
 }
 
+const SOURCE_MANIFEST_FORMAT: &str = "serenity_source_manifest";
+const SOURCE_MANIFEST_SCHEMA_VERSION: u64 = 1;
+const QUANTIZED_BLOCK_MAP_FORMAT: &str = "serenity_quantized_block_map";
+const QUANTIZED_BLOCK_MAP_SCHEMA_VERSION: u64 = 1;
+
 fn resolve_shard_path(index_path: &str, shard_name: &str) -> String {
     let shard_path = Path::new(shard_name);
     if shard_path.is_absolute() {
@@ -359,6 +364,800 @@ fn collect_sharded_tensor_layout(
     }
 
     Ok((summary, shard_paths, shard_metadata, tensors))
+}
+
+fn py_to_json_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<serde_json::Value, SsError> {
+    let json = py
+        .import_bound("json")
+        .map_err(|e| SsError::Other(e.to_string()))?;
+    let dumped: String = json
+        .call_method1("dumps", (obj,))
+        .and_then(|v| v.extract())
+        .map_err(|e| SsError::Other(format!("json.dumps failed: {e}")))?;
+    let parsed = serde_json::from_str(&dumped)?;
+    Ok(parsed)
+}
+
+fn json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+    let json = py.import_bound("json")?;
+    let dumped = serde_json::to_string(value)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(json.call_method1("loads", (dumped,))?.into())
+}
+
+fn ensure_object<'a>(
+    value: &'a serde_json::Value,
+    context: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, SsError> {
+    value.as_object()
+        .ok_or_else(|| SsError::Other(format!("{context} must be a JSON object")))
+}
+
+fn ensure_object_mut<'a>(
+    value: &'a mut serde_json::Value,
+    context: &str,
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>, SsError> {
+    value.as_object_mut()
+        .ok_or_else(|| SsError::Other(format!("{context} must be a JSON object")))
+}
+
+fn expect_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<String, SsError> {
+    object
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| SsError::Other(format!("{context}.{key} must be a string")))
+}
+
+fn optional_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<String>, SsError> {
+    match object.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|v| Some(v.to_string()))
+            .ok_or_else(|| SsError::Other(format!("{context}.{key} must be a string"))),
+    }
+}
+
+fn ensure_string_array(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<String>, SsError> {
+    let values = object
+        .get(key)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| SsError::Other(format!("{context}.{key} must be an array of strings")))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| SsError::Other(format!("{context}.{key} must be an array of strings")))
+        })
+        .collect()
+}
+
+fn validate_tensor_policy(
+    source: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), SsError> {
+    if !source.contains_key("tensor_policy") {
+        source.insert(
+            "tensor_policy".to_string(),
+            serde_json::json!({"mode": "all"}),
+        );
+    }
+    let tensor_policy = source
+        .get_mut("tensor_policy")
+        .ok_or_else(|| SsError::Other("source.tensor_policy is missing".into()))?;
+    let tensor_policy_obj = ensure_object_mut(tensor_policy, "source.tensor_policy")?;
+    let mode = expect_string(tensor_policy_obj, "mode", "source.tensor_policy")?;
+    match mode.as_str() {
+        "all" => {}
+        "prefixes" => {
+            let prefixes = ensure_string_array(tensor_policy_obj, "prefixes", "source.tensor_policy")?;
+            if prefixes.is_empty() {
+                return Err(SsError::Other(
+                    "source.tensor_policy.prefixes must not be empty".into(),
+                ));
+            }
+        }
+        "names" => {
+            let names = ensure_string_array(tensor_policy_obj, "names", "source.tensor_policy")?;
+            if names.is_empty() {
+                return Err(SsError::Other(
+                    "source.tensor_policy.names must not be empty".into(),
+                ));
+            }
+        }
+        other => {
+            return Err(SsError::Other(format!(
+                "source.tensor_policy.mode must be one of all/prefixes/names, got {other}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn resolve_manifest_path(base_dir: &Path, value: &str) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        value.to_string()
+    } else {
+        base_dir.join(path).to_string_lossy().into_owned()
+    }
+}
+
+fn resolve_manifest_path_field(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    base_dir: &Path,
+) -> Result<(), SsError> {
+    if let Some(value) = object.get_mut(key) {
+        match value {
+            serde_json::Value::String(path) => {
+                let resolved = resolve_manifest_path(base_dir, path);
+                *path = resolved;
+            }
+            serde_json::Value::Array(paths) => {
+                for item in paths {
+                    let path = item.as_str().ok_or_else(|| {
+                        SsError::Other(format!("{key} must be a string or list of strings"))
+                    })?;
+                    *item = serde_json::Value::String(resolve_manifest_path(base_dir, path));
+                }
+            }
+            _ => {
+                return Err(SsError::Other(format!(
+                    "{key} must be a string or list of strings"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_manifest_value(
+    mut manifest: serde_json::Value,
+    manifest_path: Option<&str>,
+    resolve_paths: bool,
+) -> Result<serde_json::Value, SsError> {
+    let base_dir = manifest_path
+        .and_then(|path| Path::new(path).parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let root = ensure_object_mut(&mut manifest, "manifest")?;
+    match root.get("schema_version") {
+        None => {
+            root.insert(
+                "schema_version".to_string(),
+                serde_json::Value::Number(SOURCE_MANIFEST_SCHEMA_VERSION.into()),
+            );
+        }
+        Some(value) => {
+            let schema_version = value.as_u64().ok_or_else(|| {
+                SsError::Other("manifest.schema_version must be an integer".into())
+            })?;
+            if schema_version != SOURCE_MANIFEST_SCHEMA_VERSION {
+                return Err(SsError::Other(format!(
+                    "Unsupported manifest schema_version {schema_version}"
+                )));
+            }
+        }
+    }
+    match root.get("format") {
+        None => {
+            root.insert(
+                "format".to_string(),
+                serde_json::Value::String(SOURCE_MANIFEST_FORMAT.to_string()),
+            );
+        }
+        Some(value) => {
+            let format = value.as_str().ok_or_else(|| {
+                SsError::Other("manifest.format must be a string".into())
+            })?;
+            if format != SOURCE_MANIFEST_FORMAT {
+                return Err(SsError::Other(format!(
+                    "Unsupported manifest.format {format}"
+                )));
+            }
+        }
+    }
+
+    let model = root
+        .get_mut("model")
+        .ok_or_else(|| SsError::Other("manifest.model is required".into()))?;
+    let model_obj = ensure_object_mut(model, "manifest.model")?;
+    expect_string(model_obj, "family", "manifest.model")?;
+    expect_string(model_obj, "version", "manifest.model")?;
+    optional_string(model_obj, "variant", "manifest.model")?;
+
+    let source = root
+        .get_mut("source")
+        .ok_or_else(|| SsError::Other("manifest.source is required".into()))?;
+    let source_obj = ensure_object_mut(source, "manifest.source")?;
+    let source_kind = expect_string(source_obj, "kind", "manifest.source")?;
+    match source_kind.as_str() {
+        "single_file" | "sharded_index" | "materialized_subset" | "quantized_blocks" => {}
+        other => {
+            return Err(SsError::Other(format!(
+                "manifest.source.kind must be one of single_file/sharded_index/materialized_subset/quantized_blocks, got {other}"
+            )))
+        }
+    }
+    optional_string(source_obj, "path", "manifest.source")?;
+    optional_string(source_obj, "original", "manifest.source")?;
+    optional_string(source_obj, "signature", "manifest.source")?;
+    optional_string(source_obj, "dtype", "manifest.source")?;
+    validate_tensor_policy(source_obj)?;
+
+    if resolve_paths {
+        resolve_manifest_path_field(source_obj, "path", &base_dir)?;
+    }
+
+    if let Some(artifacts) = root.get_mut("artifacts") {
+        let artifacts_obj = ensure_object_mut(artifacts, "manifest.artifacts")?;
+        if resolve_paths {
+            for key in ["path", "index", "block_map", "weights", "data_files", "files"] {
+                resolve_manifest_path_field(artifacts_obj, key, &base_dir)?;
+            }
+        }
+    }
+
+    if let Some(quantization) = root.get_mut("quantization") {
+        let quant_obj = ensure_object_mut(quantization, "manifest.quantization")?;
+        expect_string(quant_obj, "mode", "manifest.quantization")?;
+        if let Some(value) = quant_obj.get("block_count") {
+            value.as_u64().ok_or_else(|| {
+                SsError::Other("manifest.quantization.block_count must be an integer".into())
+            })?;
+        }
+        if let Some(value) = quant_obj.get("group_size") {
+            value.as_u64().ok_or_else(|| {
+                SsError::Other("manifest.quantization.group_size must be an integer".into())
+            })?;
+        }
+        if !quant_obj.contains_key("frozen") {
+            quant_obj.insert("frozen".to_string(), serde_json::Value::Bool(true));
+        } else if quant_obj.get("frozen").and_then(|value| value.as_bool()).is_none() {
+            return Err(SsError::Other(
+                "manifest.quantization.frozen must be a boolean".into(),
+            ));
+        }
+    }
+
+    if let Some(compatibility) = root.get_mut("compatibility") {
+        let compatibility_obj =
+            ensure_object_mut(compatibility, "manifest.compatibility")?;
+        for key in [
+            "minimum_serenity_version",
+            "stagehand_layout",
+            "required_source_signature",
+            "required_quant_mode",
+        ] {
+            optional_string(compatibility_obj, key, "manifest.compatibility")?;
+        }
+    }
+
+    if let Some(metadata) = root.get("metadata") {
+        ensure_object(metadata, "manifest.metadata")?;
+    }
+
+    Ok(manifest)
+}
+
+fn build_source_manifest_value(
+    model_family: &str,
+    model_version: &str,
+    source_kind: &str,
+    source_path: Option<&str>,
+    original_source: Option<&str>,
+    source_signature: Option<&str>,
+    dtype: Option<&str>,
+    variant: Option<&str>,
+    tensor_prefixes: Option<Vec<String>>,
+    tensor_names: Option<Vec<String>>,
+    minimum_serenity_version: Option<&str>,
+    stagehand_layout: Option<&str>,
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<serde_json::Value, SsError> {
+    if tensor_prefixes.as_ref().is_some_and(|v| !v.is_empty())
+        && tensor_names.as_ref().is_some_and(|v| !v.is_empty())
+    {
+        return Err(SsError::Other(
+            "Provide either tensor_prefixes or tensor_names, not both".into(),
+        ));
+    }
+
+    let tensor_policy = if let Some(names) = tensor_names.filter(|v| !v.is_empty()) {
+        serde_json::json!({ "mode": "names", "names": names })
+    } else if let Some(prefixes) = tensor_prefixes.filter(|v| !v.is_empty()) {
+        serde_json::json!({ "mode": "prefixes", "prefixes": prefixes })
+    } else {
+        serde_json::json!({ "mode": "all" })
+    };
+
+    let mut root = serde_json::json!({
+        "schema_version": SOURCE_MANIFEST_SCHEMA_VERSION,
+        "format": SOURCE_MANIFEST_FORMAT,
+        "model": {
+            "family": model_family,
+            "version": model_version,
+        },
+        "source": {
+            "kind": source_kind,
+            "tensor_policy": tensor_policy,
+        },
+    });
+
+    {
+        let root_obj = ensure_object_mut(&mut root, "manifest")?;
+        let model_obj = root_obj
+            .get_mut("model")
+            .and_then(|value| value.as_object_mut())
+            .expect("model");
+        if let Some(variant) = variant {
+            model_obj.insert(
+                "variant".to_string(),
+                serde_json::Value::String(variant.to_string()),
+            );
+        }
+
+        let source_obj = root_obj
+            .get_mut("source")
+            .and_then(|value| value.as_object_mut())
+            .expect("source");
+        if let Some(path) = source_path {
+            source_obj.insert("path".to_string(), serde_json::Value::String(path.to_string()));
+        }
+        if let Some(original) = original_source {
+            source_obj.insert(
+                "original".to_string(),
+                serde_json::Value::String(original.to_string()),
+            );
+        }
+        if let Some(signature) = source_signature {
+            source_obj.insert(
+                "signature".to_string(),
+                serde_json::Value::String(signature.to_string()),
+            );
+        }
+        if let Some(dtype) = dtype {
+            source_obj.insert(
+                "dtype".to_string(),
+                serde_json::Value::String(dtype.to_string()),
+            );
+        }
+
+        if minimum_serenity_version.is_some() || stagehand_layout.is_some() {
+            let mut compatibility = serde_json::Map::new();
+            if let Some(minimum_serenity_version) = minimum_serenity_version {
+                compatibility.insert(
+                    "minimum_serenity_version".to_string(),
+                    serde_json::Value::String(minimum_serenity_version.to_string()),
+                );
+            }
+            if let Some(stagehand_layout) = stagehand_layout {
+                compatibility.insert(
+                    "stagehand_layout".to_string(),
+                    serde_json::Value::String(stagehand_layout.to_string()),
+                );
+            }
+            root_obj.insert(
+                "compatibility".to_string(),
+                serde_json::Value::Object(compatibility),
+            );
+        }
+
+        if let Some(extra_metadata) = extra_metadata {
+            ensure_object(&extra_metadata, "manifest.metadata")?;
+            root_obj.insert("metadata".to_string(), extra_metadata);
+        }
+    }
+
+    normalize_manifest_value(root, None, false)
+}
+
+fn build_quantized_source_manifest_value(
+    model_family: &str,
+    model_version: &str,
+    source_path: Option<&str>,
+    original_source: &str,
+    source_signature: &str,
+    block_map_path: &str,
+    data_files: Vec<String>,
+    quant_mode: &str,
+    dtype: Option<&str>,
+    variant: Option<&str>,
+    tensor_prefixes: Option<Vec<String>>,
+    block_count: Option<u64>,
+    group_size: Option<u64>,
+    minimum_serenity_version: Option<&str>,
+    stagehand_layout: Option<&str>,
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<serde_json::Value, SsError> {
+    let mut manifest = build_source_manifest_value(
+        model_family,
+        model_version,
+        "quantized_blocks",
+        source_path,
+        Some(original_source),
+        Some(source_signature),
+        dtype,
+        variant,
+        tensor_prefixes,
+        None,
+        minimum_serenity_version,
+        stagehand_layout,
+        extra_metadata,
+    )?;
+
+    let root = ensure_object_mut(&mut manifest, "manifest")?;
+    root.insert(
+        "artifacts".to_string(),
+        serde_json::json!({
+            "block_map": block_map_path,
+            "data_files": data_files,
+        }),
+    );
+    let mut quantization = serde_json::Map::new();
+    quantization.insert(
+        "mode".to_string(),
+        serde_json::Value::String(quant_mode.to_string()),
+    );
+    quantization.insert("frozen".to_string(), serde_json::Value::Bool(true));
+    if let Some(block_count) = block_count {
+        quantization.insert(
+            "block_count".to_string(),
+            serde_json::Value::Number(block_count.into()),
+        );
+    }
+    if let Some(group_size) = group_size {
+        quantization.insert(
+            "group_size".to_string(),
+            serde_json::Value::Number(group_size.into()),
+        );
+    }
+    root.insert(
+        "quantization".to_string(),
+        serde_json::Value::Object(quantization),
+    );
+    if let Some(compatibility) = root.get_mut("compatibility") {
+        let compatibility_obj =
+            ensure_object_mut(compatibility, "manifest.compatibility")?;
+        compatibility_obj.insert(
+            "required_source_signature".to_string(),
+            serde_json::Value::String(source_signature.to_string()),
+        );
+        compatibility_obj.insert(
+            "required_quant_mode".to_string(),
+            serde_json::Value::String(quant_mode.to_string()),
+        );
+    } else {
+        root.insert(
+            "compatibility".to_string(),
+            serde_json::json!({
+                "required_source_signature": source_signature,
+                "required_quant_mode": quant_mode,
+            }),
+        );
+    }
+
+    normalize_manifest_value(manifest, None, false)
+}
+
+fn read_manifest_value(path: &str, resolve_paths: bool) -> Result<serde_json::Value, SsError> {
+    let raw = fs::read_to_string(path)?;
+    let manifest = serde_json::from_str(&raw)?;
+    normalize_manifest_value(manifest, Some(path), resolve_paths)
+}
+
+fn write_manifest_value(path: &str, manifest: serde_json::Value) -> Result<(), SsError> {
+    let manifest = normalize_manifest_value(manifest, Some(path), false)?;
+    let serialized = serde_json::to_vec_pretty(&manifest)?;
+    fs::write(path, serialized)?;
+    Ok(())
+}
+
+fn evaluate_manifest_compatibility(
+    manifest: &serde_json::Value,
+    model_family: &str,
+    model_version: &str,
+    source_signature: Option<&str>,
+    quant_mode: Option<&str>,
+    stagehand_layout: Option<&str>,
+) -> serde_json::Value {
+    let mut reasons = Vec::new();
+    let root = manifest.as_object().expect("normalized manifest root");
+    let model = root
+        .get("model")
+        .and_then(|value| value.as_object())
+        .expect("normalized model");
+    let source = root
+        .get("source")
+        .and_then(|value| value.as_object())
+        .expect("normalized source");
+
+    let manifest_family = model.get("family").and_then(|v| v.as_str()).unwrap_or("");
+    let manifest_version = model.get("version").and_then(|v| v.as_str()).unwrap_or("");
+    if manifest_family != model_family {
+        reasons.push(format!(
+            "model family mismatch: manifest={manifest_family}, requested={model_family}"
+        ));
+    }
+    if manifest_version != model_version {
+        reasons.push(format!(
+            "model version mismatch: manifest={manifest_version}, requested={model_version}"
+        ));
+    }
+
+    if let Some(required_signature) = root
+        .get("compatibility")
+        .and_then(|value| value.as_object())
+        .and_then(|compatibility| compatibility.get("required_source_signature"))
+        .and_then(|value| value.as_str())
+        .or_else(|| source.get("signature").and_then(|value| value.as_str()))
+    {
+        if let Some(source_signature) = source_signature {
+            if required_signature != source_signature {
+                reasons.push(format!(
+                    "source signature mismatch: manifest={required_signature}, requested={source_signature}"
+                ));
+            }
+        }
+    }
+
+    if let Some(required_quant_mode) = root
+        .get("compatibility")
+        .and_then(|value| value.as_object())
+        .and_then(|compatibility| compatibility.get("required_quant_mode"))
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            root.get("quantization")
+                .and_then(|value| value.as_object())
+                .and_then(|quantization| quantization.get("mode"))
+                .and_then(|value| value.as_str())
+        })
+    {
+        if let Some(quant_mode) = quant_mode {
+            if required_quant_mode != quant_mode {
+                reasons.push(format!(
+                    "quant mode mismatch: manifest={required_quant_mode}, requested={quant_mode}"
+                ));
+            }
+        }
+    }
+
+    if let Some(required_stagehand_layout) = root
+        .get("compatibility")
+        .and_then(|value| value.as_object())
+        .and_then(|compatibility| compatibility.get("stagehand_layout"))
+        .and_then(|value| value.as_str())
+    {
+        if let Some(stagehand_layout) = stagehand_layout {
+            if required_stagehand_layout != stagehand_layout {
+                reasons.push(format!(
+                    "stagehand layout mismatch: manifest={required_stagehand_layout}, requested={stagehand_layout}"
+                ));
+            }
+        }
+    }
+
+    serde_json::json!({
+        "ok": reasons.is_empty(),
+        "reasons": reasons,
+    })
+}
+
+fn normalize_quantized_block_map_value(
+    mut block_map: serde_json::Value,
+    block_map_path: Option<&str>,
+    resolve_paths: bool,
+) -> Result<serde_json::Value, SsError> {
+    let base_dir = block_map_path
+        .and_then(|path| Path::new(path).parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let root = ensure_object_mut(&mut block_map, "block_map")?;
+
+    match root.get("schema_version") {
+        None => {
+            root.insert(
+                "schema_version".to_string(),
+                serde_json::Value::Number(QUANTIZED_BLOCK_MAP_SCHEMA_VERSION.into()),
+            );
+        }
+        Some(value) => {
+            let schema_version = value.as_u64().ok_or_else(|| {
+                SsError::Other("block_map.schema_version must be an integer".into())
+            })?;
+            if schema_version != QUANTIZED_BLOCK_MAP_SCHEMA_VERSION {
+                return Err(SsError::Other(format!(
+                    "Unsupported block_map.schema_version {schema_version}"
+                )));
+            }
+        }
+    }
+
+    match root.get("format") {
+        None => {
+            root.insert(
+                "format".to_string(),
+                serde_json::Value::String(QUANTIZED_BLOCK_MAP_FORMAT.to_string()),
+            );
+        }
+        Some(value) => {
+            let format = value.as_str().ok_or_else(|| {
+                SsError::Other("block_map.format must be a string".into())
+            })?;
+            if format != QUANTIZED_BLOCK_MAP_FORMAT {
+                return Err(SsError::Other(format!(
+                    "Unsupported block_map.format {format}"
+                )));
+            }
+        }
+    }
+
+    if let Some(metadata) = root.get("metadata") {
+        ensure_object(metadata, "block_map.metadata")?;
+    }
+
+    let blocks = root
+        .get_mut("blocks")
+        .ok_or_else(|| SsError::Other("block_map.blocks is required".into()))?;
+    let blocks_array = blocks.as_array_mut().ok_or_else(|| {
+        SsError::Other("block_map.blocks must be an array".into())
+    })?;
+    if blocks_array.is_empty() {
+        return Err(SsError::Other("block_map.blocks must not be empty".into()));
+    }
+
+    for (index, block) in blocks_array.iter_mut().enumerate() {
+        let block_obj = ensure_object_mut(block, "block_map.blocks[]")?;
+        if !block_obj.contains_key("id") {
+            block_obj.insert(
+                "id".to_string(),
+                serde_json::Value::String(index.to_string()),
+            );
+        } else {
+            optional_string(block_obj, "id", "block_map.blocks[]")?;
+        }
+        optional_string(block_obj, "file", "block_map.blocks[]")?
+            .ok_or_else(|| SsError::Other("block_map.blocks[].file is required".into()))?;
+        if block_obj.get("offset").and_then(|v| v.as_u64()).is_none() {
+            return Err(SsError::Other(
+                "block_map.blocks[].offset must be an integer".into(),
+            ));
+        }
+        if block_obj.get("nbytes").and_then(|v| v.as_u64()).is_none() {
+            return Err(SsError::Other(
+                "block_map.blocks[].nbytes must be an integer".into(),
+            ));
+        }
+        if let Some(tensors) = block_obj.get("tensors") {
+            let array = tensors.as_array().ok_or_else(|| {
+                SsError::Other("block_map.blocks[].tensors must be an array of strings".into())
+            })?;
+            for value in array {
+                value.as_str().ok_or_else(|| {
+                    SsError::Other("block_map.blocks[].tensors must be an array of strings".into())
+                })?;
+            }
+        }
+        if resolve_paths {
+            resolve_manifest_path_field(block_obj, "file", &base_dir)?;
+        }
+    }
+
+    Ok(block_map)
+}
+
+fn write_quantized_block_map_value(path: &str, block_map: serde_json::Value) -> Result<(), SsError> {
+    let block_map = normalize_quantized_block_map_value(block_map, Some(path), false)?;
+    let serialized = serde_json::to_vec_pretty(&block_map)?;
+    fs::write(path, serialized)?;
+    Ok(())
+}
+
+fn read_quantized_block_map_value(
+    path: &str,
+    resolve_paths: bool,
+) -> Result<serde_json::Value, SsError> {
+    let raw = fs::read_to_string(path)?;
+    let block_map = serde_json::from_str(&raw)?;
+    normalize_quantized_block_map_value(block_map, Some(path), resolve_paths)
+}
+
+fn verify_quantized_manifest_artifacts_value(path: &str) -> Result<serde_json::Value, SsError> {
+    let manifest = read_manifest_value(path, true)?;
+    let root = ensure_object(&manifest, "manifest")?;
+    let source = root
+        .get("source")
+        .ok_or_else(|| SsError::Other("manifest.source is required".into()))?;
+    let source_obj = ensure_object(source, "manifest.source")?;
+    let source_kind = expect_string(source_obj, "kind", "manifest.source")?;
+    if source_kind != "quantized_blocks" {
+        return Err(SsError::Other(
+            "verify_quantized_manifest_artifacts requires a quantized_blocks manifest".into(),
+        ));
+    }
+
+    let artifacts = root
+        .get("artifacts")
+        .ok_or_else(|| SsError::Other("manifest.artifacts is required".into()))?;
+    let artifacts_obj = ensure_object(artifacts, "manifest.artifacts")?;
+    let block_map_path = expect_string(artifacts_obj, "block_map", "manifest.artifacts")?;
+    let data_files = ensure_string_array(artifacts_obj, "data_files", "manifest.artifacts")?;
+
+    let mut reasons = Vec::new();
+    if !Path::new(&block_map_path).exists() {
+        reasons.push(format!("missing block_map file: {block_map_path}"));
+    }
+    for data_file in &data_files {
+        if !Path::new(data_file).exists() {
+            reasons.push(format!("missing data file: {data_file}"));
+        }
+    }
+
+    let mut block_count = None;
+    let mut declared_files = data_files.clone();
+    declared_files.sort();
+    declared_files.dedup();
+
+    if reasons.is_empty() {
+        let block_map = read_quantized_block_map_value(&block_map_path, true)?;
+        let block_map_obj = ensure_object(&block_map, "block_map")?;
+        let blocks = block_map_obj
+            .get("blocks")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| SsError::Other("block_map.blocks must be an array".into()))?;
+        block_count = Some(blocks.len() as u64);
+
+        let mut referenced_files = Vec::new();
+        for block in blocks {
+            let block_obj = ensure_object(block, "block_map.blocks[]")?;
+            let file = expect_string(block_obj, "file", "block_map.blocks[]")?;
+            referenced_files.push(file);
+        }
+        referenced_files.sort();
+        referenced_files.dedup();
+
+        for file in &referenced_files {
+            if !declared_files.contains(file) {
+                reasons.push(format!(
+                    "block_map references undeclared data file: {file}"
+                ));
+            }
+        }
+
+        if let Some(quantization) = root.get("quantization") {
+            let quant_obj = ensure_object(quantization, "manifest.quantization")?;
+            if let Some(expected_count) = quant_obj.get("block_count").and_then(|value| value.as_u64()) {
+                if Some(expected_count) != block_count {
+                    reasons.push(format!(
+                        "block_count mismatch: manifest={expected_count}, block_map={}",
+                        block_count.unwrap_or(0)
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "ok": reasons.is_empty(),
+        "block_map": block_map_path,
+        "declared_data_files": data_files,
+        "block_count": block_count,
+        "reasons": reasons,
+    }))
 }
 
 // ── Streaming write helpers ─────────────────────────────────────────────────
@@ -1417,6 +2216,193 @@ fn sharded_tensor_layout(py: Python<'_>, index_path: &str) -> PyResult<PyObject>
     Ok(result.into())
 }
 
+/// Build a canonical Serenity source manifest.
+#[pyfunction]
+#[pyo3(signature = (
+    model_family,
+    model_version,
+    source_kind,
+    source_path=None,
+    original_source=None,
+    source_signature=None,
+    dtype=None,
+    variant=None,
+    tensor_prefixes=None,
+    tensor_names=None,
+    minimum_serenity_version=None,
+    stagehand_layout=None,
+    extra_metadata=None
+))]
+fn source_manifest(
+    py: Python<'_>,
+    model_family: &str,
+    model_version: &str,
+    source_kind: &str,
+    source_path: Option<&str>,
+    original_source: Option<&str>,
+    source_signature: Option<&str>,
+    dtype: Option<&str>,
+    variant: Option<&str>,
+    tensor_prefixes: Option<Vec<String>>,
+    tensor_names: Option<Vec<String>>,
+    minimum_serenity_version: Option<&str>,
+    stagehand_layout: Option<&str>,
+    extra_metadata: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PyObject> {
+    let extra_metadata = extra_metadata
+        .map(|value| py_to_json_value(py, value))
+        .transpose()?;
+    let manifest = build_source_manifest_value(
+        model_family,
+        model_version,
+        source_kind,
+        source_path,
+        original_source,
+        source_signature,
+        dtype,
+        variant,
+        tensor_prefixes,
+        tensor_names,
+        minimum_serenity_version,
+        stagehand_layout,
+        extra_metadata,
+    )?;
+    json_value_to_py(py, &manifest)
+}
+
+/// Build a canonical Serenity manifest for persisted quantized sources.
+#[pyfunction]
+#[pyo3(signature = (
+    model_family,
+    model_version,
+    original_source,
+    source_signature,
+    block_map_path,
+    data_files,
+    source_path=None,
+    quant_mode="eriquant",
+    dtype=None,
+    variant=None,
+    tensor_prefixes=None,
+    block_count=None,
+    group_size=None,
+    minimum_serenity_version=None,
+    stagehand_layout=None,
+    extra_metadata=None
+))]
+fn quantized_source_manifest(
+    py: Python<'_>,
+    model_family: &str,
+    model_version: &str,
+    original_source: &str,
+    source_signature: &str,
+    block_map_path: &str,
+    data_files: Vec<String>,
+    source_path: Option<&str>,
+    quant_mode: &str,
+    dtype: Option<&str>,
+    variant: Option<&str>,
+    tensor_prefixes: Option<Vec<String>>,
+    block_count: Option<u64>,
+    group_size: Option<u64>,
+    minimum_serenity_version: Option<&str>,
+    stagehand_layout: Option<&str>,
+    extra_metadata: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PyObject> {
+    let extra_metadata = extra_metadata
+        .map(|value| py_to_json_value(py, value))
+        .transpose()?;
+    let manifest = build_quantized_source_manifest_value(
+        model_family,
+        model_version,
+        source_path,
+        original_source,
+        source_signature,
+        block_map_path,
+        data_files,
+        quant_mode,
+        dtype,
+        variant,
+        tensor_prefixes,
+        block_count,
+        group_size,
+        minimum_serenity_version,
+        stagehand_layout,
+        extra_metadata,
+    )?;
+    json_value_to_py(py, &manifest)
+}
+
+/// Read and validate a Serenity source manifest.
+#[pyfunction]
+#[pyo3(signature = (path, resolve_paths=true))]
+fn read_manifest(py: Python<'_>, path: &str, resolve_paths: bool) -> PyResult<PyObject> {
+    let manifest = read_manifest_value(path, resolve_paths)?;
+    json_value_to_py(py, &manifest)
+}
+
+/// Validate and write a Serenity source manifest.
+#[pyfunction]
+fn write_manifest(py: Python<'_>, path: &str, manifest: &Bound<'_, PyAny>) -> PyResult<()> {
+    let manifest = py_to_json_value(py, manifest)?;
+    write_manifest_value(path, manifest)?;
+    Ok(())
+}
+
+/// Check whether a manifest matches the requested runtime/source constraints.
+#[pyfunction]
+#[pyo3(signature = (
+    path,
+    model_family,
+    model_version,
+    source_signature=None,
+    quant_mode=None,
+    stagehand_layout=None
+))]
+fn check_manifest_compatibility(
+    py: Python<'_>,
+    path: &str,
+    model_family: &str,
+    model_version: &str,
+    source_signature: Option<&str>,
+    quant_mode: Option<&str>,
+    stagehand_layout: Option<&str>,
+) -> PyResult<PyObject> {
+    let manifest = read_manifest_value(path, false)?;
+    let result = evaluate_manifest_compatibility(
+        &manifest,
+        model_family,
+        model_version,
+        source_signature,
+        quant_mode,
+        stagehand_layout,
+    );
+    json_value_to_py(py, &result)
+}
+
+/// Read and validate a Serenity quantized block-map file.
+#[pyfunction]
+#[pyo3(signature = (path, resolve_paths=true))]
+fn read_quantized_block_map(py: Python<'_>, path: &str, resolve_paths: bool) -> PyResult<PyObject> {
+    let block_map = read_quantized_block_map_value(path, resolve_paths)?;
+    json_value_to_py(py, &block_map)
+}
+
+/// Validate and write a Serenity quantized block-map file.
+#[pyfunction]
+fn write_quantized_block_map(py: Python<'_>, path: &str, block_map: &Bound<'_, PyAny>) -> PyResult<()> {
+    let block_map = py_to_json_value(py, block_map)?;
+    write_quantized_block_map_value(path, block_map)?;
+    Ok(())
+}
+
+/// Verify that a quantized-source manifest points to a consistent block-map/data-file set.
+#[pyfunction]
+fn verify_quantized_manifest_artifacts(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let result = verify_quantized_manifest_artifacts_value(path)?;
+    json_value_to_py(py, &result)
+}
+
 // ── Module definition ───────────────────────────────────────────────────────
 
 #[pymodule]
@@ -1440,6 +2426,14 @@ fn serenity_safetensors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(shard_index, m)?)?;
     m.add_function(wrap_pyfunction!(sharded_tensor_names, m)?)?;
     m.add_function(wrap_pyfunction!(sharded_tensor_layout, m)?)?;
+    m.add_function(wrap_pyfunction!(source_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(quantized_source_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(read_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(write_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(check_manifest_compatibility, m)?)?;
+    m.add_function(wrap_pyfunction!(read_quantized_block_map, m)?)?;
+    m.add_function(wrap_pyfunction!(write_quantized_block_map, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_quantized_manifest_artifacts, m)?)?;
     Ok(())
 }
 
@@ -1862,5 +2856,224 @@ mod tests {
 
         fs::remove_dir_all(dir).ok();
         fs::remove_file(output).ok();
+    }
+
+    #[test]
+    fn source_manifest_roundtrip_resolves_relative_paths() {
+        let dir = temp_path("manifest_dir", "dir");
+        fs::create_dir_all(&dir).expect("create manifest dir");
+        let manifest_path = Path::new(&dir).join("source_manifest.json");
+
+        let manifest = build_source_manifest_value(
+            "ltx2_19b",
+            "2.3",
+            "materialized_subset",
+            Some("transformer_only.safetensors"),
+            Some("hf://Lightricks/LTX-2.3-distilled"),
+            Some("sha256:abc123"),
+            Some("bfloat16"),
+            Some("distilled"),
+            Some(vec!["transformer.".to_string()]),
+            None,
+            Some("0.4.0"),
+            Some("transformer_blocks_v1"),
+            Some(serde_json::json!({"note": "test"})),
+        )
+        .expect("build manifest");
+        write_manifest_value(manifest_path.to_string_lossy().as_ref(), manifest).expect("write");
+
+        let raw = read_manifest_value(manifest_path.to_string_lossy().as_ref(), false).expect("read raw");
+        let resolved =
+            read_manifest_value(manifest_path.to_string_lossy().as_ref(), true).expect("read resolved");
+
+        let raw_path = raw
+            .get("source")
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+            .expect("raw source path");
+        assert_eq!(raw_path, "transformer_only.safetensors");
+
+        let resolved_path = resolved
+            .get("source")
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+            .expect("resolved source path");
+        assert_eq!(
+            resolved_path,
+            Path::new(&dir)
+                .join("transformer_only.safetensors")
+                .to_string_lossy()
+                .as_ref()
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quantized_manifest_compatibility_checks_signature_and_layout() {
+        let manifest = build_quantized_source_manifest_value(
+            "ltx2_19b",
+            "2.3",
+            Some("eriquant_cache"),
+            "hf://Lightricks/LTX-2.3-distilled",
+            "sha256:source123",
+            "blocks.json",
+            vec!["block_000.bin".to_string(), "block_001.bin".to_string()],
+            "eriquant",
+            Some("bfloat16"),
+            Some("distilled"),
+            Some(vec!["transformer.".to_string()]),
+            Some(4128),
+            Some(64),
+            Some("0.4.0"),
+            Some("transformer_blocks_v1"),
+            Some(serde_json::json!({"frozen_base": true})),
+        )
+        .expect("build quant manifest");
+
+        let ok = evaluate_manifest_compatibility(
+            &manifest,
+            "ltx2_19b",
+            "2.3",
+            Some("sha256:source123"),
+            Some("eriquant"),
+            Some("transformer_blocks_v1"),
+        );
+        assert_eq!(ok.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let bad = evaluate_manifest_compatibility(
+            &manifest,
+            "ltx2_19b",
+            "2.3",
+            Some("sha256:wrong"),
+            Some("squareq"),
+            Some("other_layout"),
+        );
+        assert_eq!(bad.get("ok").and_then(|v| v.as_bool()), Some(false));
+        let reasons = bad
+            .get("reasons")
+            .and_then(|v| v.as_array())
+            .expect("reasons");
+        assert!(reasons.iter().any(|v| v.as_str().unwrap_or("").contains("source signature mismatch")));
+        assert!(reasons.iter().any(|v| v.as_str().unwrap_or("").contains("quant mode mismatch")));
+        assert!(reasons.iter().any(|v| v.as_str().unwrap_or("").contains("stagehand layout mismatch")));
+    }
+
+    #[test]
+    fn quantized_block_map_roundtrip_resolves_relative_paths() {
+        let dir = temp_path("block_map_dir", "dir");
+        fs::create_dir_all(&dir).expect("create block_map dir");
+        let block_map_path = Path::new(&dir).join("blocks.json");
+
+        let block_map = serde_json::json!({
+            "metadata": {"quant_mode": "eriquant"},
+            "blocks": [
+                {"id": "0", "file": "block_000.bin", "offset": 0, "nbytes": 128, "tensors": ["a.weight"]},
+                {"id": "1", "file": "block_001.bin", "offset": 0, "nbytes": 256, "tensors": ["b.weight"]}
+            ]
+        });
+        write_quantized_block_map_value(block_map_path.to_string_lossy().as_ref(), block_map)
+            .expect("write block map");
+
+        let raw = read_quantized_block_map_value(block_map_path.to_string_lossy().as_ref(), false)
+            .expect("read block map");
+        let resolved =
+            read_quantized_block_map_value(block_map_path.to_string_lossy().as_ref(), true)
+                .expect("read resolved block map");
+        let raw_file = raw
+            .get("blocks")
+            .and_then(|v| v.as_array())
+            .and_then(|blocks| blocks.first())
+            .and_then(|block| block.get("file"))
+            .and_then(|v| v.as_str())
+            .expect("raw file");
+        assert_eq!(raw_file, "block_000.bin");
+
+        let resolved_file = resolved
+            .get("blocks")
+            .and_then(|v| v.as_array())
+            .and_then(|blocks| blocks.first())
+            .and_then(|block| block.get("file"))
+            .and_then(|v| v.as_str())
+            .expect("resolved file");
+        assert_eq!(
+            resolved_file,
+            Path::new(&dir)
+                .join("block_000.bin")
+                .to_string_lossy()
+                .as_ref()
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn verify_quantized_manifest_artifacts_checks_block_map_and_files() {
+        let dir = temp_path("quant_verify", "dir");
+        fs::create_dir_all(&dir).expect("create verify dir");
+        let block_map_path = Path::new(&dir).join("blocks.json");
+        let data_file = Path::new(&dir).join("block_000.bin");
+        fs::write(&data_file, [0u8; 16]).expect("write data file");
+
+        write_quantized_block_map_value(
+            block_map_path.to_string_lossy().as_ref(),
+            serde_json::json!({
+                "blocks": [
+                    {"file": "block_000.bin", "offset": 0, "nbytes": 16, "tensors": ["a.weight"]}
+                ]
+            }),
+        )
+        .expect("write block map");
+
+        let manifest_path = Path::new(&dir).join("quantized.source.json");
+        let manifest = build_quantized_source_manifest_value(
+            "ltx2_19b",
+            "2.3",
+            Some("eriquant_cache"),
+            "hf://Lightricks/LTX-2.3-distilled",
+            "sha256:source123",
+            "blocks.json",
+            vec!["block_000.bin".to_string()],
+            "eriquant",
+            Some("bfloat16"),
+            None,
+            Some(vec!["transformer.".to_string()]),
+            Some(1),
+            Some(64),
+            None,
+            Some("transformer_blocks_v1"),
+            None,
+        )
+        .expect("build manifest");
+        write_manifest_value(manifest_path.to_string_lossy().as_ref(), manifest).expect("write manifest");
+
+        let ok = verify_quantized_manifest_artifacts_value(manifest_path.to_string_lossy().as_ref())
+            .expect("verify ok");
+        assert_eq!(ok.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(ok.get("block_count").and_then(|v| v.as_u64()), Some(1));
+
+        write_quantized_block_map_value(
+            block_map_path.to_string_lossy().as_ref(),
+            serde_json::json!({
+                "blocks": [
+                    {"file": "block_001.bin", "offset": 0, "nbytes": 16, "tensors": ["a.weight"]}
+                ]
+            }),
+        )
+        .expect("rewrite block map");
+        let bad = verify_quantized_manifest_artifacts_value(manifest_path.to_string_lossy().as_ref())
+            .expect("verify bad");
+        assert_eq!(bad.get("ok").and_then(|v| v.as_bool()), Some(false));
+        let reasons = bad
+            .get("reasons")
+            .and_then(|v| v.as_array())
+            .expect("reasons");
+        assert!(reasons.iter().any(|v| {
+            v.as_str()
+                .unwrap_or("")
+                .contains("undeclared data file")
+        }));
+
+        fs::remove_dir_all(dir).ok();
     }
 }
