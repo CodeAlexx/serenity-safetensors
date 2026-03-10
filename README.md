@@ -331,10 +331,11 @@ The current package is now good enough to act as a real Serenity source layer fo
 - lower-RAM checkpoint saves
 - persisted quantized block payload containers
 
-The next major steps are:
+All roadmap phases are complete. The package is fully adopted in the Serenity trainer for:
 
-- Serenity-side adoption of quantized-source reuse in the standard memory path
-- richer training metadata/manifests for model family, quant mode, compatibility, and source signatures
+- O_DIRECT checkpoint saves (saver.py, trainer.py)
+- source manifest resolution (Stagehand source resolver)
+- persisted EriQuant frozen base reuse (eriquant_stagehand.py)
 
 Detailed implementation phases are tracked in [ROADMAP.md](ROADMAP.md).
 

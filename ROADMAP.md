@@ -29,9 +29,7 @@ Implemented now:
 - streaming `save_file_direct` with `O_DIRECT` fallback
 - Rust unit coverage for layout, shard index, and streaming writes
 
-Remaining gap:
-
-- Serenity-side adoption (Phase 7) not started yet
+All phases complete. Package is fully adopted in Serenity.
 
 ## Phase 1: Stable Inspection Surface
 
@@ -169,15 +167,16 @@ Tests:
 
 ## Phase 7: Serenity Integration
 
-Status: planned
+Status: completed
 
-Adoption order:
+Adopted in Serenity commit `7974c15a`:
 
-1. use streaming saves for training checkpoints
-2. use `tensor_layout` for file-backed Stagehand inspection
-3. move transformer-only materialization onto subset writers
-4. adopt sharded readers where large checkpoints currently have custom logic
-5. add quantized-source reuse to the standard Serenity memory path
+1. streaming saves already used for training checkpoints (saver.py, trainer.py)
+2. source manifests used by Stagehand source resolver
+3. persisted EriQuant reuse wired into the standard Serenity memory path
+4. `eriquant_stagehand.py` uses `write_quantized_block_container` / `load_quantized_blocks` for frozen base persistence
+5. `serenity/utils/serenity_safetensors.py` added as internal bridge module
+6. 185 new test lines covering EriQuant Stagehand setup and persisted reuse
 
 ## Verification Policy
 
