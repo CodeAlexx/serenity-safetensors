@@ -14,6 +14,8 @@ Additional:
     check_manifest_compatibility — verify manifest/runtime compatibility
     read_quantized_block_map / write_quantized_block_map — persist and reload quantized block maps
     verify_quantized_manifest_artifacts — verify quantized payload consistency
+    write_quantized_block_container — write a deterministic opaque block-payload container
+    load_quantized_blocks — reload opaque block payloads from a block map or source manifest
     materialize_selective — write a subset file by explicit tensor names
     materialize_by_prefix — write a subset file by prefix
     materialize_sharded_selective — subset materialization from a sharded index
@@ -39,6 +41,7 @@ from . import (
     read_quantized_block_map,
     write_quantized_block_map,
     verify_quantized_manifest_artifacts,
+    write_quantized_block_container,
     materialize_selective,
     materialize_by_prefix,
     materialize_sharded_selective,
@@ -49,6 +52,7 @@ from . import (
     load_sharded,
     load_sharded_selective,
     load_sharded_by_prefix,
+    load_quantized_blocks,
     file_metadata,
     tensor_layout,
     training_metadata,
@@ -69,6 +73,7 @@ __all__ = [
     "read_quantized_block_map",
     "write_quantized_block_map",
     "verify_quantized_manifest_artifacts",
+    "write_quantized_block_container",
     "materialize_selective",
     "materialize_by_prefix",
     "materialize_sharded_selective",
@@ -79,6 +84,7 @@ __all__ = [
     "load_sharded",
     "load_sharded_selective",
     "load_sharded_by_prefix",
+    "load_quantized_blocks",
     "file_metadata",
     "tensor_layout",
     "training_metadata",

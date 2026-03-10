@@ -14,6 +14,7 @@ Key features:
   - source_manifest / quantized_source_manifest: canonical Serenity source-manifest builders
   - read_manifest / write_manifest / check_manifest_compatibility: manifest persistence and checks
   - read_quantized_block_map / write_quantized_block_map / verify_quantized_manifest_artifacts: quantized payload validation
+  - write_quantized_block_container / load_quantized_blocks: persisted opaque block payload containers
   - file_metadata: header-only read, no tensor data touched
   - tensor_layout / sharded_tensor_layout: Stagehand-friendly byte offsets
   - FP8 dtype support (float8_e4m3fn, float8_e5m2)
@@ -30,6 +31,7 @@ from .serenity_safetensors import (
     read_quantized_block_map,
     write_quantized_block_map,
     verify_quantized_manifest_artifacts,
+    write_quantized_block_container,
     materialize_selective,
     materialize_by_prefix,
     materialize_sharded_selective,
@@ -40,6 +42,7 @@ from .serenity_safetensors import (
     _load_sharded_raw,
     _load_sharded_selective_raw,
     _load_sharded_by_prefix_raw,
+    _load_quantized_blocks_raw,
     file_metadata,
     tensor_layout,
     training_metadata,
@@ -127,6 +130,12 @@ def load_sharded_by_prefix(index_path, prefix, device="cpu"):
     return SafeTensorsDict(tensor_dict, mmap_handles)
 
 
+def load_quantized_blocks(reference_path, block_ids=None, device="cpu"):
+    """Load opaque quantized block payloads from a block-map or source manifest."""
+    tensor_dict, mmap_handles = _load_quantized_blocks_raw(reference_path, block_ids, device)
+    return SafeTensorsDict(tensor_dict, mmap_handles)
+
+
 from . import torch
 
 __all__ = [
@@ -140,6 +149,7 @@ __all__ = [
     "read_quantized_block_map",
     "write_quantized_block_map",
     "verify_quantized_manifest_artifacts",
+    "write_quantized_block_container",
     "materialize_selective",
     "materialize_by_prefix",
     "materialize_sharded_selective",
@@ -150,6 +160,7 @@ __all__ = [
     "load_sharded",
     "load_sharded_selective",
     "load_sharded_by_prefix",
+    "load_quantized_blocks",
     "file_metadata",
     "tensor_layout",
     "training_metadata",

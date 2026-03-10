@@ -139,7 +139,7 @@ Why it matters:
 
 ## Phase 6: Persisted Quantized Sources
 
-Status: in progress
+Status: completed
 
 Deliverables:
 
@@ -154,12 +154,9 @@ Implemented so far:
 - compatibility/signature checks for quantized manifests
 - quantized block-map read/write helpers
 - artifact verification against block-map/data-file declarations
-
-Still missing:
-
-- actual Serenity-owned persisted quant-block container format
-- deterministic block-map validation against on-disk payloads
-- reload helpers for quantized block sources
+- Serenity-owned safetensors container format for opaque quantized block payloads
+- deterministic block-map validation against on-disk payload offsets and payload hashes
+- reload helpers for quantized block sources from either block-map paths or quantized-source manifests
 
 Why it matters:
 

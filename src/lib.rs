@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
 use safetensors::tensor::{Dtype as StDtype, View};
 use safetensors::SafeTensors;
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -260,10 +261,35 @@ struct ShardedTensorLayoutEntry {
     absolute_offsets: (usize, usize),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuantizedBlockRecord {
+    id: String,
+    file: String,
+    offset: usize,
+    nbytes: usize,
+    tensor_name: Option<String>,
+    tensors: Vec<String>,
+    payload_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuantizedBlockContainerEntry {
+    id: String,
+    tensor_name: String,
+    nbytes: usize,
+    absolute_offsets: (usize, usize),
+    payload_sha256: String,
+}
+
 const SOURCE_MANIFEST_FORMAT: &str = "serenity_source_manifest";
 const SOURCE_MANIFEST_SCHEMA_VERSION: u64 = 1;
 const QUANTIZED_BLOCK_MAP_FORMAT: &str = "serenity_quantized_block_map";
 const QUANTIZED_BLOCK_MAP_SCHEMA_VERSION: u64 = 1;
+const QUANTIZED_BLOCK_CONTAINER_FORMAT: &str = "serenity_quantized_block_container";
+const QUANTIZED_BLOCK_CONTAINER_SCHEMA_VERSION: u64 = 1;
+const QUANTIZED_BLOCK_CONTAINER_FORMAT_KEY: &str = "serenity_quantized_container_format";
+const QUANTIZED_BLOCK_CONTAINER_SCHEMA_KEY: &str = "serenity_quantized_container_schema_version";
+const QUANTIZED_BLOCK_TENSOR_PREFIX: &str = "__quantized_block__.";
 
 fn resolve_shard_path(index_path: &str, shard_name: &str) -> String {
     let shard_path = Path::new(shard_name);
@@ -366,6 +392,361 @@ fn collect_sharded_tensor_layout(
     Ok((summary, shard_paths, shard_metadata, tensors))
 }
 
+fn build_quantized_block_tensor_name(block_id: &str) -> String {
+    format!("{QUANTIZED_BLOCK_TENSOR_PREFIX}{block_id}")
+}
+
+fn parse_quantized_block_tensor_name(name: &str) -> Option<&str> {
+    name.strip_prefix(QUANTIZED_BLOCK_TENSOR_PREFIX)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push_str(format!("{byte:02x}").as_str());
+    }
+    encoded
+}
+
+fn block_map_tensor_names_from_py(
+    py: Python<'_>,
+    block_tensors: Option<&Bound<'_, PyDict>>,
+) -> Result<HashMap<String, Vec<String>>, SsError> {
+    let mut result = HashMap::new();
+    let Some(block_tensors) = block_tensors else {
+        return Ok(result);
+    };
+    for (key, value) in block_tensors.iter() {
+        let block_id = key
+            .extract::<String>()
+            .map_err(|e| SsError::Other(format!("Invalid block_tensors key: {e}")))?;
+        let tensor_names: Vec<String> = if let Ok(names) = value.extract::<Vec<String>>() {
+            names
+        } else if let Ok(py_list) = value.downcast::<PyList>() {
+            py_list
+                .iter()
+                .map(|item| {
+                    item.extract::<String>().map_err(|e| {
+                        SsError::Other(format!(
+                            "block_tensors[{block_id:?}] must contain only strings: {e}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            return Err(SsError::Other(format!(
+                "block_tensors[{block_id:?}] must be a list of strings"
+            )));
+        };
+        result.insert(block_id, tensor_names);
+    }
+    let _ = py;
+    Ok(result)
+}
+
+fn prepare_python_quantized_block_views(
+    payloads: &Bound<'_, PyDict>,
+) -> Result<Vec<(String, PythonTensorView)>, SsError> {
+    let mut views = Vec::with_capacity(payloads.len());
+
+    for (key, value) in payloads.iter() {
+        let block_id: String = key
+            .extract()
+            .map_err(|e| SsError::Other(format!("Invalid block id: {e}")))?;
+
+        let dtype_str: String = value
+            .getattr("dtype")
+            .and_then(|d| d.str().map(|s| s.to_string()))
+            .map_err(|e| SsError::Other(format!("Cannot get dtype for block {block_id}: {e}")))?;
+        let st_dtype = dtype_from_torch_str(&dtype_str)?;
+        if st_dtype != StDtype::U8 {
+            return Err(SsError::Other(format!(
+                "Quantized block payload {block_id} must be torch.uint8, got {dtype_str}"
+            )));
+        }
+
+        let cpu_tensor = value
+            .call_method0("detach")
+            .and_then(|t| t.call_method0("cpu"))
+            .and_then(|t| t.call_method0("contiguous"))
+            .and_then(|t| t.call_method1("reshape", (PyTuple::new_bound(value.py(), [(-1i64)]),)))
+            .map_err(|e| {
+                SsError::Other(format!("Cannot prepare quantized block {block_id}: {e}"))
+            })?;
+
+        let nbytes = cpu_tensor
+            .call_method0("numel")
+            .and_then(|v| v.extract::<usize>())
+            .map_err(|e| SsError::Other(format!("Cannot get numel for block {block_id}: {e}")))?;
+
+        let storage = cpu_tensor.call_method0("untyped_storage").map_err(|e| {
+            SsError::Other(format!("untyped_storage failed for block {block_id}: {e}"))
+        })?;
+        let data_ptr = storage
+            .call_method0("data_ptr")
+            .map_err(|e| SsError::Other(format!("data_ptr failed for block {block_id}: {e}")))?
+            .extract::<usize>()
+            .map_err(|e| SsError::Other(format!("ptr extract failed for block {block_id}: {e}")))?;
+
+        if data_ptr == 0 && nbytes > 0 {
+            return Err(SsError::Other(format!(
+                "Null data_ptr for block {block_id}"
+            )));
+        }
+
+        views.push((
+            build_quantized_block_tensor_name(&block_id),
+            PythonTensorView {
+                dtype: StDtype::U8,
+                shape: vec![nbytes],
+                data_ptr,
+                nbytes,
+                tensor: cpu_tensor.unbind(),
+            },
+        ));
+    }
+
+    Ok(views)
+}
+
+fn build_quantized_block_container_metadata(
+    metadata: Option<HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut metadata = metadata.unwrap_or_default();
+    metadata.insert(
+        QUANTIZED_BLOCK_CONTAINER_FORMAT_KEY.to_string(),
+        QUANTIZED_BLOCK_CONTAINER_FORMAT.to_string(),
+    );
+    metadata.insert(
+        QUANTIZED_BLOCK_CONTAINER_SCHEMA_KEY.to_string(),
+        QUANTIZED_BLOCK_CONTAINER_SCHEMA_VERSION.to_string(),
+    );
+    metadata
+}
+
+fn collect_quantized_block_container_entries(
+    path: &str,
+) -> Result<Option<Vec<QuantizedBlockContainerEntry>>, SsError> {
+    let (metadata, entries) = collect_tensor_layout(path)?;
+    let Some(container_format) = metadata.get(QUANTIZED_BLOCK_CONTAINER_FORMAT_KEY) else {
+        return Ok(None);
+    };
+    if container_format != QUANTIZED_BLOCK_CONTAINER_FORMAT {
+        return Err(SsError::Other(format!(
+            "Unsupported quantized container format {container_format} in {path}"
+        )));
+    }
+    let schema_version = metadata
+        .get(QUANTIZED_BLOCK_CONTAINER_SCHEMA_KEY)
+        .ok_or_else(|| {
+            SsError::Other(format!(
+                "Missing {QUANTIZED_BLOCK_CONTAINER_SCHEMA_KEY} metadata in {path}"
+            ))
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            SsError::Other(format!(
+                "{QUANTIZED_BLOCK_CONTAINER_SCHEMA_KEY} must be an integer string in {path}"
+            ))
+        })?;
+    if schema_version != QUANTIZED_BLOCK_CONTAINER_SCHEMA_VERSION {
+        return Err(SsError::Other(format!(
+            "Unsupported quantized container schema version {schema_version} in {path}"
+        )));
+    }
+
+    let file = fs::File::open(path)?;
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let mut blocks = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.dtype != "U8" {
+            return Err(SsError::Other(format!(
+                "Quantized block container tensors must use U8 payloads: {} has dtype {}",
+                entry.name, entry.dtype
+            )));
+        }
+        if entry.shape.len() != 1 {
+            return Err(SsError::Other(format!(
+                "Quantized block container tensors must be 1D byte payloads: {} has shape {:?}",
+                entry.name, entry.shape
+            )));
+        }
+        let block_id = parse_quantized_block_tensor_name(&entry.name).ok_or_else(|| {
+            SsError::Other(format!(
+                "Quantized block container tensor name {} does not use the {} prefix",
+                entry.name, QUANTIZED_BLOCK_TENSOR_PREFIX
+            ))
+        })?;
+        let payload = &mmap[entry.absolute_offsets.0..entry.absolute_offsets.1];
+        blocks.push(QuantizedBlockContainerEntry {
+            id: block_id.to_string(),
+            tensor_name: entry.name,
+            nbytes: entry.nbytes,
+            absolute_offsets: entry.absolute_offsets,
+            payload_sha256: sha256_hex(payload),
+        });
+    }
+    Ok(Some(blocks))
+}
+
+fn parse_quantized_block_records(
+    block_map: &serde_json::Value,
+) -> Result<Vec<QuantizedBlockRecord>, SsError> {
+    let root = ensure_object(block_map, "block_map")?;
+    let blocks = root
+        .get("blocks")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| SsError::Other("block_map.blocks must be an array".into()))?;
+
+    let mut seen_ids = HashSet::new();
+    let mut records = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let block_obj = ensure_object(block, "block_map.blocks[]")?;
+        let id = expect_string(block_obj, "id", "block_map.blocks[]")?;
+        if !seen_ids.insert(id.clone()) {
+            return Err(SsError::Other(format!(
+                "block_map.blocks contains duplicate id {id}"
+            )));
+        }
+        let file = expect_string(block_obj, "file", "block_map.blocks[]")?;
+        let offset = block_obj
+            .get("offset")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| SsError::Other("block_map.blocks[].offset must be an integer".into()))?
+            as usize;
+        let nbytes = block_obj
+            .get("nbytes")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| SsError::Other("block_map.blocks[].nbytes must be an integer".into()))?
+            as usize;
+        let tensor_name = optional_string(block_obj, "tensor_name", "block_map.blocks[]")?;
+        let payload_sha256 = optional_string(block_obj, "payload_sha256", "block_map.blocks[]")?;
+        let tensors = match block_obj.get("tensors") {
+            Some(_) => ensure_string_array(block_obj, "tensors", "block_map.blocks[]")?,
+            None => Vec::new(),
+        };
+        records.push(QuantizedBlockRecord {
+            id,
+            file,
+            offset,
+            nbytes,
+            tensor_name,
+            tensors,
+            payload_sha256,
+        });
+    }
+
+    Ok(records)
+}
+
+fn build_quantized_block_map_for_container(
+    container_path: &str,
+    file_field: &str,
+    block_tensors: &HashMap<String, Vec<String>>,
+) -> Result<serde_json::Value, SsError> {
+    let container_entries =
+        collect_quantized_block_container_entries(container_path)?.ok_or_else(|| {
+            SsError::Other(format!(
+                "{container_path} is not a quantized block container"
+            ))
+        })?;
+
+    let mut blocks = Vec::with_capacity(container_entries.len());
+    for entry in container_entries {
+        let tensors = block_tensors.get(&entry.id).cloned().unwrap_or_default();
+        blocks.push(serde_json::json!({
+            "id": entry.id,
+            "file": file_field,
+            "offset": entry.absolute_offsets.0,
+            "nbytes": entry.nbytes,
+            "tensor_name": entry.tensor_name,
+            "tensors": tensors,
+            "payload_sha256": entry.payload_sha256,
+        }));
+    }
+    blocks.sort_by(|left, right| {
+        left.get("id")
+            .and_then(|value| value.as_str())
+            .cmp(&right.get("id").and_then(|value| value.as_str()))
+    });
+
+    Ok(serde_json::json!({
+        "metadata": {
+            "container_format": QUANTIZED_BLOCK_CONTAINER_FORMAT,
+            "container_schema_version": QUANTIZED_BLOCK_CONTAINER_SCHEMA_VERSION.to_string(),
+            "payload_dtype": "U8",
+        },
+        "blocks": blocks,
+    }))
+}
+
+fn read_quantized_block_map_reference_value(
+    path: &str,
+    resolve_paths: bool,
+) -> Result<serde_json::Value, SsError> {
+    if let Ok(manifest) = read_manifest_value(path, resolve_paths) {
+        let root = ensure_object(&manifest, "manifest")?;
+        let source = root
+            .get("source")
+            .ok_or_else(|| SsError::Other("manifest.source is required".into()))?;
+        let source_obj = ensure_object(source, "manifest.source")?;
+        let source_kind = expect_string(source_obj, "kind", "manifest.source")?;
+        if source_kind == "quantized_blocks" {
+            let artifacts = root
+                .get("artifacts")
+                .ok_or_else(|| SsError::Other("manifest.artifacts is required".into()))?;
+            let artifacts_obj = ensure_object(artifacts, "manifest.artifacts")?;
+            let block_map_path = expect_string(artifacts_obj, "block_map", "manifest.artifacts")?;
+            return read_quantized_block_map_value(&block_map_path, resolve_paths);
+        }
+    }
+
+    read_quantized_block_map_value(path, resolve_paths)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn load_quantized_block_payloads_value(
+    reference_path: &str,
+    requested_ids: Option<&HashSet<String>>,
+) -> Result<HashMap<String, Vec<u8>>, SsError> {
+    let block_map = read_quantized_block_map_reference_value(reference_path, true)?;
+    let records = parse_quantized_block_records(&block_map)?;
+
+    let mut grouped: HashMap<String, Vec<QuantizedBlockRecord>> = HashMap::new();
+    for record in records {
+        if requested_ids.is_some_and(|ids| !ids.contains(record.id.as_str())) {
+            continue;
+        }
+        grouped.entry(record.file.clone()).or_default().push(record);
+    }
+
+    let mut payloads = HashMap::new();
+    let mut file_paths: Vec<String> = grouped.keys().cloned().collect();
+    file_paths.sort();
+    for file_path in file_paths {
+        let file = fs::File::open(&file_path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let file_len = mmap.len();
+        let mut file_records = grouped.remove(&file_path).unwrap_or_default();
+        file_records.sort_by(|left, right| left.id.cmp(&right.id));
+        for record in file_records {
+            let end = record.offset.saturating_add(record.nbytes);
+            if end > file_len {
+                return Err(SsError::Other(format!(
+                    "block {} exceeds file bounds in {}: offset={} nbytes={} file_size={}",
+                    record.id, file_path, record.offset, record.nbytes, file_len
+                )));
+            }
+            payloads.insert(record.id, mmap[record.offset..end].to_vec());
+        }
+    }
+
+    Ok(payloads)
+}
+
 fn py_to_json_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<serde_json::Value, SsError> {
     let json = py
         .import_bound("json")
@@ -380,8 +761,8 @@ fn py_to_json_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> Result<serde_json
 
 fn json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     let json = py.import_bound("json")?;
-    let dumped = serde_json::to_string(value)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let dumped =
+        serde_json::to_string(value).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(json.call_method1("loads", (dumped,))?.into())
 }
 
@@ -389,7 +770,8 @@ fn ensure_object<'a>(
     value: &'a serde_json::Value,
     context: &str,
 ) -> Result<&'a serde_json::Map<String, serde_json::Value>, SsError> {
-    value.as_object()
+    value
+        .as_object()
         .ok_or_else(|| SsError::Other(format!("{context} must be a JSON object")))
 }
 
@@ -397,7 +779,8 @@ fn ensure_object_mut<'a>(
     value: &'a mut serde_json::Value,
     context: &str,
 ) -> Result<&'a mut serde_json::Map<String, serde_json::Value>, SsError> {
-    value.as_object_mut()
+    value
+        .as_object_mut()
         .ok_or_else(|| SsError::Other(format!("{context} must be a JSON object")))
 }
 
@@ -439,10 +822,9 @@ fn ensure_string_array(
     values
         .iter()
         .map(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| SsError::Other(format!("{context}.{key} must be an array of strings")))
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                SsError::Other(format!("{context}.{key} must be an array of strings"))
+            })
         })
         .collect()
 }
@@ -464,7 +846,8 @@ fn validate_tensor_policy(
     match mode.as_str() {
         "all" => {}
         "prefixes" => {
-            let prefixes = ensure_string_array(tensor_policy_obj, "prefixes", "source.tensor_policy")?;
+            let prefixes =
+                ensure_string_array(tensor_policy_obj, "prefixes", "source.tensor_policy")?;
             if prefixes.is_empty() {
                 return Err(SsError::Other(
                     "source.tensor_policy.prefixes must not be empty".into(),
@@ -562,9 +945,9 @@ fn normalize_manifest_value(
             );
         }
         Some(value) => {
-            let format = value.as_str().ok_or_else(|| {
-                SsError::Other("manifest.format must be a string".into())
-            })?;
+            let format = value
+                .as_str()
+                .ok_or_else(|| SsError::Other("manifest.format must be a string".into()))?;
             if format != SOURCE_MANIFEST_FORMAT {
                 return Err(SsError::Other(format!(
                     "Unsupported manifest.format {format}"
@@ -607,7 +990,14 @@ fn normalize_manifest_value(
     if let Some(artifacts) = root.get_mut("artifacts") {
         let artifacts_obj = ensure_object_mut(artifacts, "manifest.artifacts")?;
         if resolve_paths {
-            for key in ["path", "index", "block_map", "weights", "data_files", "files"] {
+            for key in [
+                "path",
+                "index",
+                "block_map",
+                "weights",
+                "data_files",
+                "files",
+            ] {
                 resolve_manifest_path_field(artifacts_obj, key, &base_dir)?;
             }
         }
@@ -628,7 +1018,11 @@ fn normalize_manifest_value(
         }
         if !quant_obj.contains_key("frozen") {
             quant_obj.insert("frozen".to_string(), serde_json::Value::Bool(true));
-        } else if quant_obj.get("frozen").and_then(|value| value.as_bool()).is_none() {
+        } else if quant_obj
+            .get("frozen")
+            .and_then(|value| value.as_bool())
+            .is_none()
+        {
             return Err(SsError::Other(
                 "manifest.quantization.frozen must be a boolean".into(),
             ));
@@ -636,8 +1030,7 @@ fn normalize_manifest_value(
     }
 
     if let Some(compatibility) = root.get_mut("compatibility") {
-        let compatibility_obj =
-            ensure_object_mut(compatibility, "manifest.compatibility")?;
+        let compatibility_obj = ensure_object_mut(compatibility, "manifest.compatibility")?;
         for key in [
             "minimum_serenity_version",
             "stagehand_layout",
@@ -717,7 +1110,10 @@ fn build_source_manifest_value(
             .and_then(|value| value.as_object_mut())
             .expect("source");
         if let Some(path) = source_path {
-            source_obj.insert("path".to_string(), serde_json::Value::String(path.to_string()));
+            source_obj.insert(
+                "path".to_string(),
+                serde_json::Value::String(path.to_string()),
+            );
         }
         if let Some(original) = original_source {
             source_obj.insert(
@@ -832,8 +1228,7 @@ fn build_quantized_source_manifest_value(
         serde_json::Value::Object(quantization),
     );
     if let Some(compatibility) = root.get_mut("compatibility") {
-        let compatibility_obj =
-            ensure_object_mut(compatibility, "manifest.compatibility")?;
+        let compatibility_obj = ensure_object_mut(compatibility, "manifest.compatibility")?;
         compatibility_obj.insert(
             "required_source_signature".to_string(),
             serde_json::Value::String(source_signature.to_string()),
@@ -995,9 +1390,9 @@ fn normalize_quantized_block_map_value(
             );
         }
         Some(value) => {
-            let format = value.as_str().ok_or_else(|| {
-                SsError::Other("block_map.format must be a string".into())
-            })?;
+            let format = value
+                .as_str()
+                .ok_or_else(|| SsError::Other("block_map.format must be a string".into()))?;
             if format != QUANTIZED_BLOCK_MAP_FORMAT {
                 return Err(SsError::Other(format!(
                     "Unsupported block_map.format {format}"
@@ -1013,9 +1408,9 @@ fn normalize_quantized_block_map_value(
     let blocks = root
         .get_mut("blocks")
         .ok_or_else(|| SsError::Other("block_map.blocks is required".into()))?;
-    let blocks_array = blocks.as_array_mut().ok_or_else(|| {
-        SsError::Other("block_map.blocks must be an array".into())
-    })?;
+    let blocks_array = blocks
+        .as_array_mut()
+        .ok_or_else(|| SsError::Other("block_map.blocks must be an array".into()))?;
     if blocks_array.is_empty() {
         return Err(SsError::Other("block_map.blocks must not be empty".into()));
     }
@@ -1042,6 +1437,8 @@ fn normalize_quantized_block_map_value(
                 "block_map.blocks[].nbytes must be an integer".into(),
             ));
         }
+        optional_string(block_obj, "tensor_name", "block_map.blocks[]")?;
+        optional_string(block_obj, "payload_sha256", "block_map.blocks[]")?;
         if let Some(tensors) = block_obj.get("tensors") {
             let array = tensors.as_array().ok_or_else(|| {
                 SsError::Other("block_map.blocks[].tensors must be an array of strings".into())
@@ -1060,7 +1457,10 @@ fn normalize_quantized_block_map_value(
     Ok(block_map)
 }
 
-fn write_quantized_block_map_value(path: &str, block_map: serde_json::Value) -> Result<(), SsError> {
+fn write_quantized_block_map_value(
+    path: &str,
+    block_map: serde_json::Value,
+) -> Result<(), SsError> {
     let block_map = normalize_quantized_block_map_value(block_map, Some(path), false)?;
     let serialized = serde_json::to_vec_pretty(&block_map)?;
     fs::write(path, serialized)?;
@@ -1074,6 +1474,108 @@ fn read_quantized_block_map_value(
     let raw = fs::read_to_string(path)?;
     let block_map = serde_json::from_str(&raw)?;
     normalize_quantized_block_map_value(block_map, Some(path), resolve_paths)
+}
+
+fn validate_quantized_block_records(
+    records: &[QuantizedBlockRecord],
+) -> Result<Vec<String>, SsError> {
+    let mut reasons = Vec::new();
+    let mut grouped: HashMap<String, Vec<&QuantizedBlockRecord>> = HashMap::new();
+    for record in records {
+        grouped.entry(record.file.clone()).or_default().push(record);
+    }
+
+    for (file, file_records) in grouped {
+        if !Path::new(&file).exists() {
+            reasons.push(format!("missing data file referenced by block_map: {file}"));
+            continue;
+        }
+
+        let is_safetensors = Path::new(&file)
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"));
+
+        if is_safetensors {
+            match collect_quantized_block_container_entries(&file) {
+                Ok(Some(container_entries)) => {
+                    let entry_map: HashMap<String, QuantizedBlockContainerEntry> =
+                        container_entries
+                            .into_iter()
+                            .map(|entry| (entry.tensor_name.clone(), entry))
+                            .collect();
+                    for record in file_records {
+                        let tensor_name = record
+                            .tensor_name
+                            .clone()
+                            .unwrap_or_else(|| build_quantized_block_tensor_name(&record.id));
+                        let Some(entry) = entry_map.get(&tensor_name) else {
+                            reasons.push(format!(
+                                "block {} references missing container tensor {} in {}",
+                                record.id, tensor_name, file
+                            ));
+                            continue;
+                        };
+                        if record.offset != entry.absolute_offsets.0 {
+                            reasons.push(format!(
+                                "block {} offset mismatch: block_map={} container={}",
+                                record.id, record.offset, entry.absolute_offsets.0
+                            ));
+                        }
+                        if record.nbytes != entry.nbytes {
+                            reasons.push(format!(
+                                "block {} nbytes mismatch: block_map={} container={}",
+                                record.id, record.nbytes, entry.nbytes
+                            ));
+                        }
+                        if let Some(expected_hash) = &record.payload_sha256 {
+                            if expected_hash != &entry.payload_sha256 {
+                                reasons.push(format!(
+                                    "block {} payload hash mismatch: block_map={} container={}",
+                                    record.id, expected_hash, entry.payload_sha256
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {
+                    reasons.push(format!(
+                        "safetensors file {} is missing {} metadata",
+                        file, QUANTIZED_BLOCK_CONTAINER_FORMAT_KEY
+                    ));
+                }
+                Err(err) => {
+                    reasons.push(format!("invalid quantized block container {file}: {err}"));
+                }
+            }
+        } else {
+            let file_len = fs::metadata(&file)?.len() as usize;
+            let file_handle = fs::File::open(&file)?;
+            let mmap = unsafe { MmapOptions::new().map(&file_handle)? };
+            for record in file_records {
+                let end = record.offset.saturating_add(record.nbytes);
+                if end > file_len {
+                    reasons.push(format!(
+                        "block {} exceeds file bounds: offset={} nbytes={} file_size={}",
+                        record.id, record.offset, record.nbytes, file_len
+                    ));
+                    continue;
+                }
+                if let Some(expected_hash) = &record.payload_sha256 {
+                    let payload = &mmap[record.offset..end];
+                    let actual_hash = sha256_hex(payload);
+                    if expected_hash != &actual_hash {
+                        reasons.push(format!(
+                            "block {} payload hash mismatch: block_map={} file={}",
+                            record.id, expected_hash, actual_hash
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(reasons)
 }
 
 fn verify_quantized_manifest_artifacts_value(path: &str) -> Result<serde_json::Value, SsError> {
@@ -1111,36 +1613,35 @@ fn verify_quantized_manifest_artifacts_value(path: &str) -> Result<serde_json::V
     let mut declared_files = data_files.clone();
     declared_files.sort();
     declared_files.dedup();
+    let mut validated_files = Vec::new();
 
     if reasons.is_empty() {
         let block_map = read_quantized_block_map_value(&block_map_path, true)?;
-        let block_map_obj = ensure_object(&block_map, "block_map")?;
-        let blocks = block_map_obj
-            .get("blocks")
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| SsError::Other("block_map.blocks must be an array".into()))?;
-        block_count = Some(blocks.len() as u64);
+        let records = parse_quantized_block_records(&block_map)?;
+        block_count = Some(records.len() as u64);
 
         let mut referenced_files = Vec::new();
-        for block in blocks {
-            let block_obj = ensure_object(block, "block_map.blocks[]")?;
-            let file = expect_string(block_obj, "file", "block_map.blocks[]")?;
-            referenced_files.push(file);
+        for record in &records {
+            referenced_files.push(record.file.clone());
         }
         referenced_files.sort();
         referenced_files.dedup();
+        validated_files = referenced_files.clone();
 
         for file in &referenced_files {
             if !declared_files.contains(file) {
-                reasons.push(format!(
-                    "block_map references undeclared data file: {file}"
-                ));
+                reasons.push(format!("block_map references undeclared data file: {file}"));
             }
         }
 
+        reasons.extend(validate_quantized_block_records(&records)?);
+
         if let Some(quantization) = root.get("quantization") {
             let quant_obj = ensure_object(quantization, "manifest.quantization")?;
-            if let Some(expected_count) = quant_obj.get("block_count").and_then(|value| value.as_u64()) {
+            if let Some(expected_count) = quant_obj
+                .get("block_count")
+                .and_then(|value| value.as_u64())
+            {
                 if Some(expected_count) != block_count {
                     reasons.push(format!(
                         "block_count mismatch: manifest={expected_count}, block_map={}",
@@ -1155,6 +1656,7 @@ fn verify_quantized_manifest_artifacts_value(path: &str) -> Result<serde_json::V
         "ok": reasons.is_empty(),
         "block_map": block_map_path,
         "declared_data_files": data_files,
+        "validated_data_files": validated_files,
         "block_count": block_count,
         "reasons": reasons,
     }))
@@ -1198,14 +1700,14 @@ fn metadata_from_py_dict(
     metadata: Option<&Bound<'_, PyDict>>,
 ) -> Result<Option<HashMap<String, String>>, SsError> {
     Ok(metadata.map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| {
-                    let key = k.extract::<String>().ok()?;
-                    let val = v.extract::<String>().ok()?;
-                    Some((key, val))
-                })
-                .collect()
-        }))
+        m.iter()
+            .filter_map(|(k, v)| {
+                let key = k.extract::<String>().ok()?;
+                let val = v.extract::<String>().ok()?;
+                Some((key, val))
+            })
+            .collect()
+    }))
 }
 
 fn prepare_python_tensor_views(
@@ -1274,10 +1776,7 @@ fn prepare_write_plan<V: View>(
 
     let mut header = serde_json::Map::new();
     if let Some(metadata) = metadata {
-        header.insert(
-            "__metadata__".to_string(),
-            serde_json::to_value(metadata)?,
-        );
+        header.insert("__metadata__".to_string(), serde_json::to_value(metadata)?);
     }
 
     let mut offset = 0usize;
@@ -1376,28 +1875,26 @@ fn write_direct_streaming<V: View>(
             Ok(())
         };
 
-        let copy_segment = |segment: &[u8],
-                            buffered: &mut usize,
-                            exact_len: &mut usize|
-         -> Result<(), SsError> {
-            let mut segment_offset = 0usize;
-            *exact_len += segment.len();
-            while segment_offset < segment.len() {
-                let space = CHUNK_SIZE - *buffered;
-                let take = (segment.len() - segment_offset).min(space);
-                std::ptr::copy_nonoverlapping(
-                    segment.as_ptr().add(segment_offset),
-                    buf.add(*buffered),
-                    take,
-                );
-                *buffered += take;
-                segment_offset += take;
-                if *buffered == CHUNK_SIZE {
-                    flush_buffer(buffered)?;
+        let copy_segment =
+            |segment: &[u8], buffered: &mut usize, exact_len: &mut usize| -> Result<(), SsError> {
+                let mut segment_offset = 0usize;
+                *exact_len += segment.len();
+                while segment_offset < segment.len() {
+                    let space = CHUNK_SIZE - *buffered;
+                    let take = (segment.len() - segment_offset).min(space);
+                    std::ptr::copy_nonoverlapping(
+                        segment.as_ptr().add(segment_offset),
+                        buf.add(*buffered),
+                        take,
+                    );
+                    *buffered += take;
+                    segment_offset += take;
+                    if *buffered == CHUNK_SIZE {
+                        flush_buffer(buffered)?;
+                    }
                 }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
 
         let header_len_bytes = header_len.to_le_bytes();
         let write_result = (|| -> Result<(), SsError> {
@@ -1464,7 +1961,11 @@ where
     }
 
     let selected_count = selected.len();
-    let metadata = if metadata.is_empty() { None } else { Some(metadata) };
+    let metadata = if metadata.is_empty() {
+        None
+    } else {
+        Some(metadata)
+    };
     let (header_len, header_bytes, selected, total_tensor_bytes) =
         prepare_write_plan(selected, &metadata)?;
     if direct {
@@ -1528,7 +2029,11 @@ where
     }
 
     let selected_count = selected.len();
-    let metadata = if metadata.is_empty() { None } else { Some(metadata) };
+    let metadata = if metadata.is_empty() {
+        None
+    } else {
+        Some(metadata)
+    };
     let (header_len, header_bytes, selected, total_tensor_bytes) =
         prepare_write_plan(selected, &metadata)?;
     if direct {
@@ -1563,9 +2068,11 @@ fn parse_tensor_layout(
     let sl = PySlice::new_bound(py, 0, 8, 1);
     let header_len_bytes = mmap_obj.call_method1("__getitem__", (sl,))?;
     let header_len_bytes: Vec<u8> = header_len_bytes.extract()?;
-    let header_len = u64::from_le_bytes(header_len_bytes.try_into().map_err(|_| {
-        PyRuntimeError::new_err("Failed to read header length")
-    })?) as usize;
+    let header_len = u64::from_le_bytes(
+        header_len_bytes
+            .try_into()
+            .map_err(|_| PyRuntimeError::new_err("Failed to read header length"))?,
+    ) as usize;
 
     // Read header JSON
     let data_start = 8 + header_len;
@@ -1589,14 +2096,24 @@ fn parse_tensor_layout(
             let shape: Vec<usize> = info
                 .get("shape")
                 .and_then(|s| s.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
                 .unwrap_or_default();
             let offsets = info
                 .get("data_offsets")
                 .and_then(|o| o.as_array())
                 .map(|arr| {
-                    let vals: Vec<usize> = arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect();
-                    (vals.get(0).copied().unwrap_or(0), vals.get(1).copied().unwrap_or(0))
+                    let vals: Vec<usize> = arr
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect();
+                    (
+                        vals.get(0).copied().unwrap_or(0),
+                        vals.get(1).copied().unwrap_or(0),
+                    )
                 })
                 .unwrap_or((0, 0));
 
@@ -1779,8 +2296,10 @@ fn materialize_sharded_selective(
     direct: bool,
 ) -> PyResult<usize> {
     let requested: HashSet<&str> = names.iter().map(String::as_str).collect();
-    materialize_sharded_selection(index_path, output_path, direct, |name| requested.contains(name))
-        .map_err(PyErr::from)
+    materialize_sharded_selection(index_path, output_path, direct, |name| {
+        requested.contains(name)
+    })
+    .map_err(PyErr::from)
 }
 
 /// Write a new safetensors file containing only prefix-matched tensors from a sharded index.
@@ -1792,8 +2311,10 @@ fn materialize_sharded_by_prefix(
     prefix: &str,
     direct: bool,
 ) -> PyResult<usize> {
-    materialize_sharded_selection(index_path, output_path, direct, |name| name.starts_with(prefix))
-        .map_err(PyErr::from)
+    materialize_sharded_selection(index_path, output_path, direct, |name| {
+        name.starts_with(prefix)
+    })
+    .map_err(PyErr::from)
 }
 
 /// Load all tensors from a safetensors file. Returns (dict, mmap_handle).
@@ -1872,8 +2393,14 @@ fn _load_selective_raw(
     for (name, dtype, shape, start, end) in &tensors {
         if name_set.contains(name.as_str()) {
             let tensor = memview_slice_to_tensor(
-                py, &torch, &memview, dtype, shape,
-                data_start + start, data_start + end, device,
+                py,
+                &torch,
+                &memview,
+                dtype,
+                shape,
+                data_start + start,
+                data_start + end,
+                device,
             )?;
             result.set_item(name, tensor)?;
         }
@@ -1911,8 +2438,14 @@ fn _load_by_prefix_raw(
     for (name, dtype, shape, start, end) in &tensors {
         if name.starts_with(prefix) {
             let tensor = memview_slice_to_tensor(
-                py, &torch, &memview, dtype, shape,
-                data_start + start, data_start + end, device,
+                py,
+                &torch,
+                &memview,
+                dtype,
+                shape,
+                data_start + start,
+                data_start + end,
+                device,
             )?;
             result.set_item(name, tensor)?;
         }
@@ -1996,6 +2529,123 @@ fn _load_sharded_by_prefix_raw(
         let selection_names: HashSet<&str> =
             selection.tensor_names.iter().map(String::as_str).collect();
         load_selected_tensors_from_mmap(py, bound, &selection_names, device, &result)?;
+        handles.append(py_mmap)?;
+    }
+
+    let ret = PyTuple::new_bound(py, &[result.as_any(), handles.as_any()]);
+    Ok(ret.into())
+}
+
+/// Write a deterministic safetensors container for opaque quantized block payloads.
+///
+/// Each payload is stored as a single 1D U8 tensor named after its block id using
+/// the Serenity quantized-block prefix. The returned value is a validated block map
+/// that can be written with `write_quantized_block_map`.
+#[pyfunction]
+#[pyo3(signature = (payloads, path, block_tensors=None, metadata=None, direct=false))]
+fn write_quantized_block_container(
+    py: Python<'_>,
+    payloads: &Bound<'_, PyDict>,
+    path: &str,
+    block_tensors: Option<&Bound<'_, PyDict>>,
+    metadata: Option<&Bound<'_, PyDict>>,
+    direct: bool,
+) -> PyResult<PyObject> {
+    let views = prepare_python_quantized_block_views(payloads)?;
+    if views.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "write_quantized_block_container requires at least one payload",
+        ));
+    }
+
+    let block_tensors = block_map_tensor_names_from_py(py, block_tensors)?;
+    let metadata = Some(build_quantized_block_container_metadata(
+        metadata_from_py_dict(metadata)?,
+    ));
+    let (header_len, header_bytes, views, total_tensor_bytes) =
+        prepare_write_plan(views, &metadata)?;
+
+    if direct {
+        write_direct_streaming(
+            Path::new(path),
+            header_len,
+            &header_bytes,
+            &views,
+            total_tensor_bytes,
+        )?;
+    } else {
+        write_standard_streaming(Path::new(path), header_len, &header_bytes, &views)?;
+    }
+
+    let block_map = build_quantized_block_map_for_container(path, path, &block_tensors)?;
+    json_value_to_py(py, &block_map)
+}
+
+/// Load opaque quantized block payloads from a block map or quantized-source manifest.
+///
+/// Returns `(dict, mmap_handles)` where the dict maps block id -> `torch.uint8`
+/// tensor view over the persisted payload bytes.
+#[pyfunction]
+#[pyo3(signature = (reference_path, block_ids=None, device="cpu"))]
+fn _load_quantized_blocks_raw(
+    py: Python<'_>,
+    reference_path: &str,
+    block_ids: Option<Vec<String>>,
+    device: &str,
+) -> PyResult<PyObject> {
+    let block_map = read_quantized_block_map_reference_value(reference_path, true)?;
+    let records = parse_quantized_block_records(&block_map)?;
+    let requested: Option<HashSet<&str>> = block_ids
+        .as_ref()
+        .map(|ids| ids.iter().map(String::as_str).collect());
+
+    let mut grouped: HashMap<String, Vec<QuantizedBlockRecord>> = HashMap::new();
+    for record in records {
+        if requested
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(record.id.as_str()))
+        {
+            continue;
+        }
+        grouped.entry(record.file.clone()).or_default().push(record);
+    }
+
+    let builtins = py.import_bound("builtins")?;
+    let torch = py.import_bound("torch")?;
+    let result = PyDict::new_bound(py);
+    let handles = PyList::empty_bound(py);
+
+    let mut file_paths: Vec<String> = grouped.keys().cloned().collect();
+    file_paths.sort();
+    for file_path in file_paths {
+        let mut file_records = grouped.remove(&file_path).unwrap_or_default();
+        file_records.sort_by(|left, right| left.id.cmp(&right.id));
+        let py_mmap = open_readonly_mmap(py, &file_path)?;
+        let bound = py_mmap.bind(py);
+        let memview = builtins.call_method1("memoryview", (bound,))?;
+        let file_len = fs::metadata(&file_path)?.len() as usize;
+
+        for record in file_records {
+            let end = record.offset.saturating_add(record.nbytes);
+            if end > file_len {
+                return Err(PyRuntimeError::new_err(format!(
+                    "block {} exceeds file bounds in {}: offset={} nbytes={} file_size={}",
+                    record.id, file_path, record.offset, record.nbytes, file_len
+                )));
+            }
+            let tensor = memview_slice_to_tensor(
+                py,
+                &torch,
+                &memview,
+                "U8",
+                &[record.nbytes],
+                record.offset,
+                end,
+                device,
+            )?;
+            result.set_item(record.id, tensor)?;
+        }
+
         handles.append(py_mmap)?;
     }
 
@@ -2109,8 +2759,8 @@ fn training_metadata(
 /// List tensor names in a file without loading any data. Fast header-only read.
 #[pyfunction]
 fn tensor_names(path: &str) -> PyResult<Vec<String>> {
-    let (_, entries) = collect_tensor_layout(path)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let (_, entries) =
+        collect_tensor_layout(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(entries.into_iter().map(|entry| entry.name).collect())
 }
 
@@ -2157,7 +2807,8 @@ fn sharded_tensor_names(index_path: &str) -> PyResult<Vec<String>> {
 /// Return tensor layout across all shards with resolved shard paths and offsets.
 #[pyfunction]
 fn sharded_tensor_layout(py: Python<'_>, index_path: &str) -> PyResult<PyObject> {
-    let (summary, shard_paths, shard_metadata, entries) = collect_sharded_tensor_layout(index_path)?;
+    let (summary, shard_paths, shard_metadata, entries) =
+        collect_sharded_tensor_layout(index_path)?;
     let result = PyDict::new_bound(py);
     result.set_item("index_path", index_path)?;
 
@@ -2390,7 +3041,11 @@ fn read_quantized_block_map(py: Python<'_>, path: &str, resolve_paths: bool) -> 
 
 /// Validate and write a Serenity quantized block-map file.
 #[pyfunction]
-fn write_quantized_block_map(py: Python<'_>, path: &str, block_map: &Bound<'_, PyAny>) -> PyResult<()> {
+fn write_quantized_block_map(
+    py: Python<'_>,
+    path: &str,
+    block_map: &Bound<'_, PyAny>,
+) -> PyResult<()> {
     let block_map = py_to_json_value(py, block_map)?;
     write_quantized_block_map_value(path, block_map)?;
     Ok(())
@@ -2419,6 +3074,8 @@ fn serenity_safetensors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_load_sharded_raw, m)?)?;
     m.add_function(wrap_pyfunction!(_load_sharded_selective_raw, m)?)?;
     m.add_function(wrap_pyfunction!(_load_sharded_by_prefix_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(write_quantized_block_container, m)?)?;
+    m.add_function(wrap_pyfunction!(_load_quantized_blocks_raw, m)?)?;
     m.add_function(wrap_pyfunction!(file_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_layout, m)?)?;
     m.add_function(wrap_pyfunction!(training_metadata, m)?)?;
@@ -2475,7 +3132,9 @@ mod tests {
             .as_nanos();
         let pid = std::process::id();
         std::env::temp_dir()
-            .join(format!("serenity_safetensors_{name}_{pid}_{nanos}.{suffix}"))
+            .join(format!(
+                "serenity_safetensors_{name}_{pid}_{nanos}.{suffix}"
+            ))
             .to_string_lossy()
             .into_owned()
     }
@@ -2582,17 +3241,68 @@ mod tests {
                 "b.bias": "model-00002-of-00002.safetensors"
             }
         });
-        fs::write(&index_path, serde_json::to_vec(&payload).expect("json bytes")).expect("write index");
+        fs::write(
+            &index_path,
+            serde_json::to_vec(&payload).expect("json bytes"),
+        )
+        .expect("write index");
+
+        (dir, index_path.to_string_lossy().into_owned())
+    }
+
+    fn write_quantized_block_container_fixture(
+        path: &str,
+        file_field: &str,
+    ) -> (serde_json::Value, HashMap<String, Vec<u8>>) {
+        let payloads = HashMap::from([
+            ("transformer.layers.0".to_string(), vec![1u8, 3u8, 5u8, 7u8]),
+            ("transformer.layers.1".to_string(), vec![2u8, 4u8, 6u8]),
+        ]);
+        let views = payloads
+            .iter()
+            .map(|(block_id, data)| {
+                (
+                    build_quantized_block_tensor_name(block_id),
+                    ByteView {
+                        dtype: StDtype::U8,
+                        shape: vec![data.len()],
+                        data: data.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let metadata = Some(build_quantized_block_container_metadata(Some(
+            HashMap::from([("quant_mode".to_string(), "eriquant".to_string())]),
+        )));
+        let (header_len, header_bytes, views, _) =
+            prepare_write_plan(views, &metadata).expect("prepare quantized container");
+        write_standard_streaming(Path::new(path), header_len, &header_bytes, &views)
+            .expect("write quantized container");
+
+        let block_tensors = HashMap::from([
+            (
+                "transformer.layers.0".to_string(),
+                vec!["linear.weight".to_string()],
+            ),
+            (
+                "transformer.layers.1".to_string(),
+                vec!["proj.weight".to_string(), "proj.bias".to_string()],
+            ),
+        ]);
 
         (
-            dir,
-            index_path.to_string_lossy().into_owned(),
+            build_quantized_block_map_for_container(path, file_field, &block_tensors)
+                .expect("block map"),
+            payloads,
         )
     }
 
     #[test]
     fn dtype_aliases_cover_fp8_and_bfloat16() {
-        assert_eq!(dtype_from_torch_str("torch.bfloat16").expect("bf16"), StDtype::BF16);
+        assert_eq!(
+            dtype_from_torch_str("torch.bfloat16").expect("bf16"),
+            StDtype::BF16
+        );
         assert_eq!(
             dtype_from_torch_str("float8_e4m3fn").expect("fp8 e4m3"),
             StDtype::F8_E4M3
@@ -2612,7 +3322,10 @@ mod tests {
         assert_eq!(metadata.get("family").map(String::as_str), Some("ltx2"));
         assert_eq!(entries.len(), 2);
 
-        let weight = entries.iter().find(|entry| entry.name == "weight").expect("weight entry");
+        let weight = entries
+            .iter()
+            .find(|entry| entry.name == "weight")
+            .expect("weight entry");
         assert_eq!(weight.dtype, "F32");
         assert_eq!(weight.shape, vec![2, 2]);
         assert_eq!(weight.nbytes, 16);
@@ -2656,10 +3369,7 @@ mod tests {
             Some(1234)
         );
         assert_eq!(
-            summary
-                .weight_map
-                .get("a.weight")
-                .map(String::as_str),
+            summary.weight_map.get("a.weight").map(String::as_str),
             Some("model-00001-of-00002.safetensors")
         );
         assert_eq!(
@@ -2703,7 +3413,10 @@ mod tests {
             Some("ltx2")
         );
         assert_eq!(
-            entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["a.weight", "b.weight", "b.bias"]
         );
         assert!(entries.iter().all(|entry| entry.absolute_offsets.0 >= 8));
@@ -2769,13 +3482,24 @@ mod tests {
 
         let file_bytes = fs::read(&path).expect("read file");
         let parsed = SafeTensors::deserialize(&file_bytes).expect("deserialize");
-        assert_eq!(parsed.tensor("linear.weight").expect("weight").shape(), &[2, 2]);
+        assert_eq!(
+            parsed.tensor("linear.weight").expect("weight").shape(),
+            &[2, 2]
+        );
 
         let (layout_metadata, entries) = collect_tensor_layout(&path).expect("layout");
-        assert_eq!(layout_metadata.get("family").map(String::as_str), Some("ltx2"));
-        assert_eq!(layout_metadata.get("quant").map(String::as_str), Some("eriquant"));
+        assert_eq!(
+            layout_metadata.get("family").map(String::as_str),
+            Some("ltx2")
+        );
+        assert_eq!(
+            layout_metadata.get("quant").map(String::as_str),
+            Some("eriquant")
+        );
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|entry| entry.absolute_offsets.1 > entry.absolute_offsets.0));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.absolute_offsets.1 > entry.absolute_offsets.0));
 
         fs::remove_file(path).ok();
     }
@@ -2809,7 +3533,10 @@ mod tests {
 
         let file_bytes = fs::read(&path).expect("read file");
         let parsed = SafeTensors::deserialize(&file_bytes).expect("deserialize");
-        assert_eq!(parsed.tensor("tensor").expect("tensor").dtype(), StDtype::BF16);
+        assert_eq!(
+            parsed.tensor("tensor").expect("tensor").dtype(),
+            StDtype::BF16
+        );
         let (layout_metadata, _) = collect_tensor_layout(&path).expect("layout");
         assert_eq!(layout_metadata.get("step").map(String::as_str), Some("42"));
 
@@ -2822,8 +3549,9 @@ mod tests {
         let output = temp_path("materialize_subset", "safetensors");
         write_test_safetensors(&source);
 
-        let written = materialize_single_file_selection(&source, &output, false, |name| name == "bias")
-            .expect("materialize selective");
+        let written =
+            materialize_single_file_selection(&source, &output, false, |name| name == "bias")
+                .expect("materialize selective");
         assert_eq!(written, 1);
 
         let names = tensor_names(&output).expect("subset names");
@@ -2842,9 +3570,10 @@ mod tests {
         let (dir, index_path) = write_sharded_fixture();
         let output = temp_path("materialize_sharded_subset", "safetensors");
 
-        let written =
-            materialize_sharded_selection(&index_path, &output, false, |name| name.starts_with("b."))
-                .expect("materialize sharded prefix");
+        let written = materialize_sharded_selection(&index_path, &output, false, |name| {
+            name.starts_with("b.")
+        })
+        .expect("materialize sharded prefix");
         assert_eq!(written, 2);
 
         let names = tensor_names(&output).expect("subset names");
@@ -2882,9 +3611,10 @@ mod tests {
         .expect("build manifest");
         write_manifest_value(manifest_path.to_string_lossy().as_ref(), manifest).expect("write");
 
-        let raw = read_manifest_value(manifest_path.to_string_lossy().as_ref(), false).expect("read raw");
-        let resolved =
-            read_manifest_value(manifest_path.to_string_lossy().as_ref(), true).expect("read resolved");
+        let raw =
+            read_manifest_value(manifest_path.to_string_lossy().as_ref(), false).expect("read raw");
+        let resolved = read_manifest_value(manifest_path.to_string_lossy().as_ref(), true)
+            .expect("read resolved");
 
         let raw_path = raw
             .get("source")
@@ -2954,9 +3684,17 @@ mod tests {
             .get("reasons")
             .and_then(|v| v.as_array())
             .expect("reasons");
-        assert!(reasons.iter().any(|v| v.as_str().unwrap_or("").contains("source signature mismatch")));
-        assert!(reasons.iter().any(|v| v.as_str().unwrap_or("").contains("quant mode mismatch")));
-        assert!(reasons.iter().any(|v| v.as_str().unwrap_or("").contains("stagehand layout mismatch")));
+        assert!(reasons.iter().any(|v| v
+            .as_str()
+            .unwrap_or("")
+            .contains("source signature mismatch")));
+        assert!(reasons
+            .iter()
+            .any(|v| v.as_str().unwrap_or("").contains("quant mode mismatch")));
+        assert!(reasons.iter().any(|v| v
+            .as_str()
+            .unwrap_or("")
+            .contains("stagehand layout mismatch")));
     }
 
     #[test]
@@ -3045,10 +3783,12 @@ mod tests {
             None,
         )
         .expect("build manifest");
-        write_manifest_value(manifest_path.to_string_lossy().as_ref(), manifest).expect("write manifest");
+        write_manifest_value(manifest_path.to_string_lossy().as_ref(), manifest)
+            .expect("write manifest");
 
-        let ok = verify_quantized_manifest_artifacts_value(manifest_path.to_string_lossy().as_ref())
-            .expect("verify ok");
+        let ok =
+            verify_quantized_manifest_artifacts_value(manifest_path.to_string_lossy().as_ref())
+                .expect("verify ok");
         assert_eq!(ok.get("ok").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(ok.get("block_count").and_then(|v| v.as_u64()), Some(1));
 
@@ -3061,18 +3801,177 @@ mod tests {
             }),
         )
         .expect("rewrite block map");
-        let bad = verify_quantized_manifest_artifacts_value(manifest_path.to_string_lossy().as_ref())
-            .expect("verify bad");
+        let bad =
+            verify_quantized_manifest_artifacts_value(manifest_path.to_string_lossy().as_ref())
+                .expect("verify bad");
         assert_eq!(bad.get("ok").and_then(|v| v.as_bool()), Some(false));
         let reasons = bad
             .get("reasons")
             .and_then(|v| v.as_array())
             .expect("reasons");
-        assert!(reasons.iter().any(|v| {
-            v.as_str()
-                .unwrap_or("")
-                .contains("undeclared data file")
-        }));
+        assert!(reasons
+            .iter()
+            .any(|v| { v.as_str().unwrap_or("").contains("undeclared data file") }));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quantized_block_container_roundtrip_builds_offsets_and_hashes() {
+        let path = temp_path("quant_container", "safetensors");
+        let (block_map, payloads) =
+            write_quantized_block_container_fixture(&path, "quant_blocks.safetensors");
+
+        let container_entries = collect_quantized_block_container_entries(&path)
+            .expect("collect container entries")
+            .expect("container entries");
+        assert_eq!(container_entries.len(), 2);
+
+        let records = parse_quantized_block_records(&block_map).expect("parse block map");
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            let container_entry = container_entries
+                .iter()
+                .find(|entry| entry.id == record.id)
+                .expect("matching container entry");
+            let payload = payloads.get(&record.id).expect("payload");
+            assert_eq!(record.file, "quant_blocks.safetensors");
+            assert_eq!(record.offset, container_entry.absolute_offsets.0);
+            assert_eq!(record.nbytes, payload.len());
+            assert_eq!(
+                record.payload_sha256.as_deref(),
+                Some(sha256_hex(payload).as_str())
+            );
+            assert_eq!(
+                record.tensor_name.as_deref(),
+                Some(build_quantized_block_tensor_name(&record.id).as_str())
+            );
+        }
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn load_quantized_block_payloads_resolves_manifest_reference() {
+        let dir = temp_path("quant_payloads", "dir");
+        fs::create_dir_all(&dir).expect("create payload dir");
+        let container_path = Path::new(&dir).join("blocks.safetensors");
+        let block_map_path = Path::new(&dir).join("blocks.json");
+        let manifest_path = Path::new(&dir).join("quantized.source.json");
+
+        let (block_map, payloads) = write_quantized_block_container_fixture(
+            container_path.to_string_lossy().as_ref(),
+            "blocks.safetensors",
+        );
+        write_quantized_block_map_value(block_map_path.to_string_lossy().as_ref(), block_map)
+            .expect("write block map");
+        let manifest = build_quantized_source_manifest_value(
+            "ltx2_19b",
+            "2.3",
+            Some("eriquant_cache"),
+            "hf://Lightricks/LTX-2.3-distilled",
+            "sha256:source123",
+            "blocks.json",
+            vec!["blocks.safetensors".to_string()],
+            "eriquant",
+            Some("bfloat16"),
+            None,
+            Some(vec!["transformer.".to_string()]),
+            Some(2),
+            Some(64),
+            None,
+            Some("transformer_blocks_v1"),
+            None,
+        )
+        .expect("build manifest");
+        write_manifest_value(manifest_path.to_string_lossy().as_ref(), manifest)
+            .expect("write manifest");
+
+        let requested = HashSet::from(["transformer.layers.1".to_string()]);
+        let loaded = load_quantized_block_payloads_value(
+            manifest_path.to_string_lossy().as_ref(),
+            Some(&requested),
+        )
+        .expect("load payloads");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded.get("transformer.layers.1"),
+            payloads.get("transformer.layers.1")
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn verify_quantized_manifest_artifacts_checks_container_offsets_and_hashes() {
+        let dir = temp_path("quant_verify_container", "dir");
+        fs::create_dir_all(&dir).expect("create verify dir");
+        let container_path = Path::new(&dir).join("blocks.safetensors");
+        let block_map_path = Path::new(&dir).join("blocks.json");
+        let manifest_path = Path::new(&dir).join("quantized.source.json");
+
+        let (block_map, _payloads) = write_quantized_block_container_fixture(
+            container_path.to_string_lossy().as_ref(),
+            "blocks.safetensors",
+        );
+        write_quantized_block_map_value(
+            block_map_path.to_string_lossy().as_ref(),
+            block_map.clone(),
+        )
+        .expect("write block map");
+
+        let manifest = build_quantized_source_manifest_value(
+            "ltx2_19b",
+            "2.3",
+            Some("eriquant_cache"),
+            "hf://Lightricks/LTX-2.3-distilled",
+            "sha256:source123",
+            "blocks.json",
+            vec!["blocks.safetensors".to_string()],
+            "eriquant",
+            Some("bfloat16"),
+            None,
+            Some(vec!["transformer.".to_string()]),
+            Some(2),
+            Some(64),
+            None,
+            Some("transformer_blocks_v1"),
+            None,
+        )
+        .expect("build manifest");
+        write_manifest_value(manifest_path.to_string_lossy().as_ref(), manifest)
+            .expect("write manifest");
+
+        let ok =
+            verify_quantized_manifest_artifacts_value(manifest_path.to_string_lossy().as_ref())
+                .expect("verify container ok");
+        assert_eq!(ok.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(ok.get("block_count").and_then(|v| v.as_u64()), Some(2));
+
+        let mut tampered = block_map;
+        let blocks = tampered
+            .get_mut("blocks")
+            .and_then(|value| value.as_array_mut())
+            .expect("blocks");
+        blocks[0]["offset"] = serde_json::Value::Number(0u64.into());
+        blocks[1]["payload_sha256"] = serde_json::Value::String("deadbeef".to_string());
+        write_quantized_block_map_value(block_map_path.to_string_lossy().as_ref(), tampered)
+            .expect("rewrite tampered block map");
+
+        let bad =
+            verify_quantized_manifest_artifacts_value(manifest_path.to_string_lossy().as_ref())
+                .expect("verify container bad");
+        assert_eq!(bad.get("ok").and_then(|v| v.as_bool()), Some(false));
+        let reasons = bad
+            .get("reasons")
+            .and_then(|v| v.as_array())
+            .expect("reasons");
+        assert!(reasons
+            .iter()
+            .any(|v| { v.as_str().unwrap_or("").contains("offset mismatch") }));
+        assert!(reasons
+            .iter()
+            .any(|v| { v.as_str().unwrap_or("").contains("payload hash mismatch") }));
 
         fs::remove_dir_all(dir).ok();
     }

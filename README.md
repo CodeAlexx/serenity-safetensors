@@ -41,6 +41,7 @@ Standard `safetensors.torch.save_file` writes through the page cache. A 4GB chec
 | No sharded layout inspection | `sharded_tensor_layout` resolves shard paths and per-tensor offsets across the full index |
 | No reusable source manifest layer | `source_manifest`, `quantized_source_manifest`, `read_manifest`, `write_manifest`, and `check_manifest_compatibility` |
 | No quantized artifact verifier | `read_quantized_block_map`, `write_quantized_block_map`, and `verify_quantized_manifest_artifacts` |
+| No persisted quantized payload container | `write_quantized_block_container` and `load_quantized_blocks` store/reload opaque block payloads with deterministic offsets |
 | No FP8 support | F8_E4M3 (`float8_e4m3fn`) and F8_E5M2 (`float8_e5m2`) |
 | Save path builds one big output blob | `save_file` / `save_file_direct` stream header + tensor payloads incrementally |
 
@@ -146,13 +147,17 @@ materialize_sharded_by_prefix(
 ### Source manifests
 
 ```python
+import torch
+
 from serenity_safetensors.torch import (
     source_manifest,
     quantized_source_manifest,
     write_manifest,
     read_manifest,
     check_manifest_compatibility,
+    write_quantized_block_container,
     write_quantized_block_map,
+    load_quantized_blocks,
     read_quantized_block_map,
     verify_quantized_manifest_artifacts,
 )
@@ -205,6 +210,22 @@ write_quantized_block_map("blocks.json", {
 block_map = read_quantized_block_map("blocks.json")
 verify = verify_quantized_manifest_artifacts("eriquant.source.json")
 assert verify["ok"]
+
+payloads = {
+    "transformer.layers.0": torch.tensor([1, 3, 5, 7], dtype=torch.uint8),
+    "transformer.layers.1": torch.tensor([2, 4, 6], dtype=torch.uint8),
+}
+block_map = write_quantized_block_container(
+    payloads,
+    "blocks.safetensors",
+    block_tensors={
+        "transformer.layers.0": ["linear.weight"],
+        "transformer.layers.1": ["proj.weight", "proj.bias"],
+    },
+)
+write_quantized_block_map("blocks.json", block_map)
+payload_views = load_quantized_blocks("eriquant.source.json")
+assert payload_views["transformer.layers.0"].dtype == torch.uint8
 ```
 
 ### Inspect without loading data
@@ -260,6 +281,8 @@ print(layout["tensors"]["transformer.blocks.0.attn.qkv.weight"]["path"])
 | `read_quantized_block_map(path, resolve_paths=True)` | Read and validate a quantized block-map file |
 | `write_quantized_block_map(path, block_map)` | Validate and write a quantized block-map file |
 | `verify_quantized_manifest_artifacts(path)` | Verify that a quantized-source manifest matches its block map and data files |
+| `write_quantized_block_container(payloads, path, block_tensors=None, metadata=None, direct=False)` | Write a deterministic opaque block-payload container and return its block map |
+| `load_quantized_blocks(reference_path, block_ids=None, device="cpu")` | Load opaque block payload bytes from a block map or quantized-source manifest |
 | `load_file(path, device="cpu")` | Lazy mmap load, memoryview zero-copy (drop-in, 4x faster) |
 | `load_selective(path, names, device="cpu")` | Load only named tensors |
 | `load_by_prefix(path, prefix, device="cpu")` | Load prefix-matched tensors |
@@ -289,6 +312,7 @@ Current Rust verification covers:
 - source-manifest read/write/normalize helpers
 - quantized-source manifest generation and compatibility checks
 - quantized block-map read/write and artifact verification
+- quantized block-container write/reload and offset/hash validation
 - normal streaming safetensors writes
 - direct/O_DIRECT streaming safetensors writes
 
@@ -305,10 +329,11 @@ The current package is now good enough to act as a real Serenity source layer fo
 - file-backed Stagehand readers
 - transformer-only source materialization
 - lower-RAM checkpoint saves
+- persisted quantized block payload containers
 
 The next major steps are:
 
-- persisted quantized source containers for `EriQuant + Stagehand`
+- Serenity-side adoption of quantized-source reuse in the standard memory path
 - richer training metadata/manifests for model family, quant mode, compatibility, and source signatures
 
 Detailed implementation phases are tracked in [ROADMAP.md](ROADMAP.md).
