@@ -1,5 +1,14 @@
+pub mod diffusers;
+pub mod format_detect;
+pub mod gguf;
+pub mod gguf_dequant;
+pub mod probe;
+pub mod pytorch;
+pub mod quantized_tensor;
+pub mod unified;
+
 use memmap2::MmapOptions;
-use pyo3::exceptions::{PyIOError, PyRuntimeError};
+use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
 use safetensors::tensor::{Dtype as StDtype, View};
@@ -3058,6 +3067,353 @@ fn verify_quantized_manifest_artifacts(py: Python<'_>, path: &str) -> PyResult<P
     json_value_to_py(py, &result)
 }
 
+// ── Format detection & probing ───────────────────────────────────────────────
+
+#[pyfunction]
+#[pyo3(name = "detect_format")]
+fn py_detect_format(_py: Python<'_>, path: &str) -> PyResult<String> {
+    let fmt = format_detect::detect_format(std::path::Path::new(path))
+        .map_err(|e| PyValueError::new_err(e))?;
+    Ok(fmt.to_string())
+}
+
+#[pyfunction]
+#[pyo3(name = "probe_model")]
+fn py_probe_model(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let info = probe::probe_model(std::path::Path::new(path))
+        .map_err(|e| PyValueError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("format", info.format.to_string())?;
+    dict.set_item("path", info.path.to_string_lossy().to_string())?;
+    dict.set_item("tensor_count", info.tensor_count)?;
+    dict.set_item("tensor_names", info.tensor_names)?;
+    dict.set_item("param_count", info.param_count)?;
+    dict.set_item("total_file_bytes", info.total_file_bytes)?;
+
+    // tensor_shapes: dict of name → list of ints
+    let shapes_dict = PyDict::new_bound(py);
+    for (name, shape) in &info.tensor_shapes {
+        shapes_dict.set_item(name, shape)?;
+    }
+    dict.set_item("tensor_shapes", shapes_dict)?;
+
+    // tensor_dtypes: dict of name → str
+    let dtypes_dict = PyDict::new_bound(py);
+    for (name, dtype) in &info.tensor_dtypes {
+        dtypes_dict.set_item(name, dtype)?;
+    }
+    dict.set_item("tensor_dtypes", dtypes_dict)?;
+
+    // metadata: dict of str → str
+    let meta_dict = PyDict::new_bound(py);
+    for (k, v) in &info.metadata {
+        meta_dict.set_item(k, v)?;
+    }
+    dict.set_item("metadata", meta_dict)?;
+
+    // quant_types: None or dict
+    match &info.quant_types {
+        Some(qt) => {
+            let qt_dict = PyDict::new_bound(py);
+            for (k, v) in qt {
+                qt_dict.set_item(k, v)?;
+            }
+            dict.set_item("quant_types", qt_dict)?;
+        }
+        None => {
+            dict.set_item("quant_types", py.None())?;
+        }
+    }
+
+    Ok(dict.into())
+}
+
+// ── Diffusers directory probing ──────────────────────────────────────────────
+
+/// Probe a diffusers model directory and return component layout information.
+///
+/// Returns a dict with:
+///   - root: str (directory path)
+///   - pipeline_class: str | None
+///   - components: list of dicts with name, class_name, library_name, weight_source, has_config
+///   - tensor_count: int (total across all components)
+///   - param_count: int
+///   - total_file_bytes: int
+///   - tensor_names: list of str (prefixed with component name)
+#[pyfunction]
+fn probe_diffusers(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let dir = std::path::Path::new(path);
+    let layout = diffusers::DiffusersLayout::open(dir)
+        .map_err(|e| PyValueError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("root", layout.root.to_string_lossy().to_string())?;
+
+    // Pipeline class name
+    let pipeline_class = layout
+        .model_index
+        .get("_class_name")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    match pipeline_class {
+        Some(cls) => dict.set_item("pipeline_class", cls)?,
+        None => dict.set_item("pipeline_class", py.None())?,
+    }
+
+    // Components list
+    let comp_list = PyList::empty_bound(py);
+    for comp in &layout.components {
+        let cd = PyDict::new_bound(py);
+        cd.set_item("name", &comp.name)?;
+        cd.set_item(
+            "class_name",
+            comp.class_name.as_deref().map(|s| s.to_string()),
+        )?;
+        cd.set_item(
+            "library_name",
+            comp.library_name.as_deref().map(|s| s.to_string()),
+        )?;
+        let ws_str = match &comp.weight_source {
+            diffusers::WeightSource::SingleSafetensors(p) => {
+                format!("single_safetensors:{}", p.display())
+            }
+            diffusers::WeightSource::ShardedSafetensors {
+                shard_paths, ..
+            } => format!("sharded_safetensors:{}_shards", shard_paths.len()),
+            diffusers::WeightSource::SinglePytorch(p) => {
+                format!("single_pytorch:{}", p.display())
+            }
+            diffusers::WeightSource::ShardedPytorch {
+                shard_paths, ..
+            } => format!("sharded_pytorch:{}_shards", shard_paths.len()),
+            diffusers::WeightSource::None => "none".to_string(),
+        };
+        cd.set_item("weight_source", ws_str)?;
+        cd.set_item("has_config", comp.config.is_some())?;
+        comp_list.append(cd)?;
+    }
+    dict.set_item("components", comp_list)?;
+
+    // Aggregated info
+    let info = layout
+        .to_model_info()
+        .map_err(|e| PyRuntimeError::new_err(e))?;
+    dict.set_item("tensor_count", info.tensor_count)?;
+    dict.set_item("param_count", info.param_count)?;
+    dict.set_item("total_file_bytes", info.total_file_bytes)?;
+    dict.set_item("tensor_names", info.tensor_names)?;
+
+    Ok(dict.into())
+}
+
+// ── PyTorch checkpoint loading ───────────────────────────────────────────────
+
+#[pyfunction]
+fn load_pickle_index(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let index = pytorch::PickleIndex::open(std::path::Path::new(path))
+        .map_err(|e| PyRuntimeError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+
+    let names: Vec<&str> = index.tensors.iter().map(|t| t.name.as_str()).collect();
+    dict.set_item("tensor_names", names)?;
+
+    let shapes_dict = PyDict::new_bound(py);
+    for t in &index.tensors {
+        shapes_dict.set_item(&t.name, &t.shape)?;
+    }
+    dict.set_item("tensor_shapes", shapes_dict)?;
+
+    let dtypes_dict = PyDict::new_bound(py);
+    for t in &index.tensors {
+        dtypes_dict.set_item(&t.name, &t.dtype)?;
+    }
+    dict.set_item("tensor_dtypes", dtypes_dict)?;
+
+    let storage_dict = PyDict::new_bound(py);
+    for (k, v) in &index.storage_files {
+        storage_dict.set_item(k, v)?;
+    }
+    dict.set_item("storage_map", storage_dict)?;
+
+    dict.set_item("tensor_count", index.tensors.len())?;
+
+    let param_count: u64 = index.tensors.iter().map(|t| t.numel as u64).sum();
+    dict.set_item("param_count", param_count)?;
+
+    Ok(dict.into())
+}
+
+#[pyfunction]
+fn load_pickle_tensor(py: Python<'_>, path: &str, name: &str) -> PyResult<PyObject> {
+    let index = pytorch::PickleIndex::open(std::path::Path::new(path))
+        .map_err(|e| PyRuntimeError::new_err(e))?;
+
+    let info = index
+        .tensors
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!("tensor '{}' not found in checkpoint", name))
+        })?;
+
+    let raw_bytes = index
+        .read_tensor_bytes(info)
+        .map_err(|e| PyRuntimeError::new_err(e))?;
+
+    // Convert dtype string to torch dtype string for Python side
+    let torch_dtype = match info.dtype.as_str() {
+        "float32" => "torch.float32",
+        "float16" => "torch.float16",
+        "bfloat16" => "torch.bfloat16",
+        "float64" => "torch.float64",
+        "int64" => "torch.int64",
+        "int32" => "torch.int32",
+        "int16" => "torch.int16",
+        "int8" => "torch.int8",
+        "uint8" => "torch.uint8",
+        _ => "torch.float32",
+    };
+
+    // Use torch.frombuffer to create tensor from raw bytes, then reshape
+    let torch = py.import_bound("torch")?;
+
+    // Get actual dtype
+    let actual_dtype = py.eval_bound(torch_dtype, None, None)?;
+
+    let py_bytes = pyo3::types::PyBytes::new_bound(py, &raw_bytes);
+
+    let tensor = torch.call_method(
+        "frombuffer",
+        (py_bytes,),
+        Some(&{
+            let kwargs = PyDict::new_bound(py);
+            kwargs.set_item("dtype", actual_dtype)?;
+            kwargs
+        }),
+    )?;
+
+    // Clone to own the data (frombuffer returns a view of the bytes)
+    let tensor = tensor.call_method0("clone")?;
+
+    // Reshape
+    let shape: Vec<i64> = info.shape.iter().map(|&s| s as i64).collect();
+    let py_shape = PyTuple::new_bound(py, &shape);
+    let tensor = tensor.call_method1("reshape", (py_shape,))?;
+
+    Ok(tensor.into())
+}
+
+// ── GGUF loading ────────────────────────────────────────────────────────────
+
+/// Open a GGUF file and return its index as a Python dict.
+///
+/// Returns: dict with keys "version", "alignment", "tensor_count",
+/// "tensors" (list of dicts), "metadata" (dict).
+#[pyfunction]
+fn load_gguf_index(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let idx = gguf::GgufIndex::open(std::path::Path::new(path))
+        .map_err(|e| PyValueError::new_err(e))?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("version", idx.version)?;
+    dict.set_item("alignment", idx.alignment)?;
+    dict.set_item("tensor_count", idx.tensors.len())?;
+    dict.set_item("data_offset", idx.data_offset)?;
+
+    // Tensors list
+    let tensors_list = PyList::new_bound(py, Vec::<PyObject>::new());
+    for t in &idx.tensors {
+        let td = PyDict::new_bound(py);
+        td.set_item("name", &t.name)?;
+        td.set_item("shape", &t.shape)?;
+        td.set_item("quant_type", t.quant_type.name())?;
+        td.set_item("offset", t.offset)?;
+        td.set_item("byte_size", t.byte_size)?;
+        td.set_item("param_count", t.param_count)?;
+        tensors_list.append(td)?;
+    }
+    dict.set_item("tensors", tensors_list)?;
+
+    // Metadata dict
+    let meta_dict = PyDict::new_bound(py);
+    for (k, v) in &idx.metadata {
+        meta_dict.set_item(k, v.to_string_lossy())?;
+    }
+    dict.set_item("metadata", meta_dict)?;
+
+    Ok(dict.into())
+}
+
+/// Dequantize raw bytes of a specific GGUF quant type to a BF16 torch.Tensor.
+///
+/// Arguments:
+///   data: bytes — raw quantized data
+///   quant_type: str — e.g. "Q4_0", "Q8_0", "Q6_K", "F16", etc.
+///   shape: list[int] — desired output tensor shape
+#[pyfunction]
+fn dequant_tensor(py: Python<'_>, data: &[u8], quant_type: &str, shape: Vec<usize>) -> PyResult<PyObject> {
+    let qt = quant_type_from_name(quant_type)
+        .map_err(|e| PyValueError::new_err(e))?;
+
+    let n_weights: usize = if shape.is_empty() { 0 } else { shape.iter().product() };
+
+    let bf16_bytes = py
+        .allow_threads(move || {
+            let bf16_vec = gguf_dequant::dequant_to_bf16(data, qt, n_weights)?;
+            let raw: &[u8] = bytemuck::cast_slice(&bf16_vec);
+            Ok::<Vec<u8>, String>(raw.to_vec())
+        })
+        .map_err(|e| PyValueError::new_err(e))?;
+
+    let torch = py.import_bound("torch")?;
+    let bf16_dtype = torch.getattr("bfloat16")?;
+    let py_bytes = pyo3::types::PyBytes::new_bound(py, &bf16_bytes);
+    let kwargs = PyDict::new_bound(py);
+    kwargs.set_item("dtype", bf16_dtype)?;
+    let tensor = torch.call_method("frombuffer", (py_bytes,), Some(&kwargs))?;
+    let tensor = tensor.call_method0("clone")?;
+    let shape_tuple = PyTuple::new_bound(py, &shape);
+    let tensor = tensor.call_method1("reshape", (shape_tuple,))?;
+    Ok(tensor.into())
+}
+
+fn quant_type_from_name(name: &str) -> Result<gguf::GgufQuantType, String> {
+    match name {
+        "F32" => Ok(gguf::GgufQuantType::F32),
+        "F16" => Ok(gguf::GgufQuantType::F16),
+        "BF16" => Ok(gguf::GgufQuantType::BF16),
+        "F64" => Ok(gguf::GgufQuantType::F64),
+        "I8" => Ok(gguf::GgufQuantType::I8),
+        "I16" => Ok(gguf::GgufQuantType::I16),
+        "I32" => Ok(gguf::GgufQuantType::I32),
+        "I64" => Ok(gguf::GgufQuantType::I64),
+        "Q4_0" => Ok(gguf::GgufQuantType::Q4_0),
+        "Q4_1" => Ok(gguf::GgufQuantType::Q4_1),
+        "Q5_0" => Ok(gguf::GgufQuantType::Q5_0),
+        "Q5_1" => Ok(gguf::GgufQuantType::Q5_1),
+        "Q8_0" => Ok(gguf::GgufQuantType::Q8_0),
+        "Q8_1" => Ok(gguf::GgufQuantType::Q8_1),
+        "Q2_K" => Ok(gguf::GgufQuantType::Q2K),
+        "Q3_K" => Ok(gguf::GgufQuantType::Q3K),
+        "Q4_K" => Ok(gguf::GgufQuantType::Q4K),
+        "Q5_K" => Ok(gguf::GgufQuantType::Q5K),
+        "Q6_K" => Ok(gguf::GgufQuantType::Q6K),
+        "Q8_K" => Ok(gguf::GgufQuantType::Q8K),
+        "IQ2_XXS" => Ok(gguf::GgufQuantType::IQ2XXS),
+        "IQ2_XS" => Ok(gguf::GgufQuantType::IQ2XS),
+        "IQ2_S" => Ok(gguf::GgufQuantType::IQ2S),
+        "IQ3_XXS" => Ok(gguf::GgufQuantType::IQ3XXS),
+        "IQ3_S" => Ok(gguf::GgufQuantType::IQ3S),
+        "IQ4_NL" => Ok(gguf::GgufQuantType::IQ4NL),
+        "IQ4_XS" => Ok(gguf::GgufQuantType::IQ4XS),
+        "IQ1_S" => Ok(gguf::GgufQuantType::IQ1S),
+        "IQ1_M" => Ok(gguf::GgufQuantType::IQ1M),
+        other => Err(format!("unknown quant type name: {other}")),
+    }
+}
+
 // ── Module definition ───────────────────────────────────────────────────────
 
 #[pymodule]
@@ -3091,6 +3447,15 @@ fn serenity_safetensors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_quantized_block_map, m)?)?;
     m.add_function(wrap_pyfunction!(write_quantized_block_map, m)?)?;
     m.add_function(wrap_pyfunction!(verify_quantized_manifest_artifacts, m)?)?;
+    m.add_function(wrap_pyfunction!(py_detect_format, m)?)?;
+    m.add_function(wrap_pyfunction!(py_probe_model, m)?)?;
+    m.add_function(wrap_pyfunction!(probe_diffusers, m)?)?;
+    m.add_function(wrap_pyfunction!(load_pickle_index, m)?)?;
+    m.add_function(wrap_pyfunction!(load_pickle_tensor, m)?)?;
+    m.add_function(wrap_pyfunction!(load_gguf_index, m)?)?;
+    m.add_function(wrap_pyfunction!(dequant_tensor, m)?)?;
+    m.add_function(wrap_pyfunction!(unified::load_model, m)?)?;
+    m.add_class::<quantized_tensor::QuantizedTensor>()?;
     Ok(())
 }
 

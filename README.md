@@ -1,6 +1,8 @@
 # serenity-safetensors
 
-High-performance safetensors I/O for Serenity. Rust core, PyO3 bindings.
+Universal model loading for Serenity. Rust core, PyO3 bindings.
+
+Loads safetensors, GGUF (quantized), PyTorch checkpoints (.pt/.pth/.bin), and diffusers directories through a single `load_model(path)` call. GGUF quantized tensors stay compact in memory and dequantize to BF16 on demand during Stagehand H2D transfer.
 
 ## Benchmarks
 
@@ -24,6 +26,49 @@ Standard `safetensors.torch.save_file` writes through the page cache. A 4GB chec
 - Latent caches get evicted, have to be re-read
 
 `save_file_direct` bypasses the page cache entirely. Dataset and latent caches stay hot. No throughput dips.
+
+## Universal model loading
+
+```python
+from serenity_safetensors import load_model, probe_model, detect_format
+
+# Any format — safetensors, GGUF, PyTorch .pt/.pth, diffusers directory
+data = load_model("model.gguf")
+data = load_model("model.safetensors")
+data = load_model("checkpoint.pt")
+data = load_model("stable-diffusion-xl/")  # diffusers directory
+
+# Dict-like access to tensors
+tensor = data["layer.0.weight"]     # torch.Tensor (BF16) or QuantizedTensor
+
+# QuantizedTensor — GGUF quant types stay compact, dequant on demand
+if hasattr(tensor, "dequant"):
+    print(tensor.quant_type_name)   # "Q4_K"
+    print(tensor.compression_ratio) # 4.0x
+    bf16_tensor = tensor.dequant()  # → BF16 torch.Tensor
+
+# Header-only probe — no tensor data loaded (~1ms)
+info = probe_model("flux1-dev-Q4_K.gguf")
+print(info["format"])        # "gguf"
+print(info["tensor_count"])  # 291
+print(info["param_count"])   # 8030000000
+
+# Format detection from magic bytes
+fmt = detect_format("model.safetensors")  # "safetensors"
+```
+
+### Supported formats
+
+| Format | Extensions | Features |
+|--------|-----------|----------|
+| **Safetensors** | `.safetensors` | mmap, lazy loading, zero-copy |
+| **GGUF** | `.gguf` | Q4_0–Q8_K dequant, lazy QuantizedTensor, mmap |
+| **PyTorch** | `.pt`, `.pth`, `.bin` | Safe pickle scanner (no code exec), ZIP extraction |
+| **Diffusers** | directory with `model_index.json` | Component discovery, sharded files, auto-aggregation |
+
+### GGUF quantization types
+
+Full dequant support for: F16, F32, BF16, F64, I8, I16, I32, I64, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K. IQ types (IQ2_XXS, IQ3_S, etc.) are preserved as QuantizedTensor but dequant is not yet implemented.
 
 ## What's different from `safetensors.torch`
 
@@ -296,6 +341,17 @@ print(layout["tensors"]["transformer.blocks.0.attn.qkv.weight"]["path"])
 | `sharded_tensor_names(index_path)` | List all tensor names referenced by a sharded index |
 | `sharded_tensor_layout(index_path)` | Resolve shard paths and tensor byte offsets across a sharded index |
 | `training_metadata(step, lr, loss, epoch, extra)` | Build metadata dict for checkpoint saves |
+| **Universal loading** | |
+| `load_model(path, strip_prefix=None)` | Load any format — returns `ModelData` with tensors + info |
+| `probe_model(path)` | Header-only probe — format, tensor count, shapes, dtypes (~1ms) |
+| `detect_format(path)` | Magic-byte format detection → `"safetensors"`, `"gguf"`, `"pytorch_zip"`, `"diffusers"` |
+| `load_gguf_index(path)` | Open GGUF file, return tensor index for selective access |
+| `dequant_tensor(data, quant_type, shape)` | Dequantize raw GGUF bytes to BF16 torch.Tensor |
+| `load_pickle_index(path)` | Parse PyTorch checkpoint pickle, return tensor metadata |
+| `load_pickle_tensor(path, name)` | Extract a single tensor from a PyTorch checkpoint |
+| `probe_diffusers(path)` | Probe a diffusers directory — components, tensor counts, shapes |
+| `QuantizedTensor` | GGUF quantized tensor wrapper with `.dequant()`, `.shape`, `.quant_type_name`, `.compression_ratio` |
+| `ModelData` | Dict-like result from `load_model()` with `.tensors`, `.info`, `.format` |
 
 ## Verification
 
@@ -315,6 +371,13 @@ Current Rust verification covers:
 - quantized block-container write/reload and offset/hash validation
 - normal streaming safetensors writes
 - direct/O_DIRECT streaming safetensors writes
+- magic-byte format detection (safetensors, GGUF, PyTorch ZIP, diffusers directory)
+- header-only probe for all formats
+- GGUF v2/v3 parser with mmap-backed tensor index
+- 19 GGUF dequant kernels (Q4_0–Q8_K, F16/F32/BF16, I8–I64)
+- safe pickle scanner for PyTorch checkpoints (no arbitrary code execution)
+- diffusers directory layout discovery with sharded component support
+- unified load_model dispatcher across all formats
 
 Run it with:
 
@@ -331,11 +394,13 @@ The current package is now good enough to act as a real Serenity source layer fo
 - lower-RAM checkpoint saves
 - persisted quantized block payload containers
 
-All roadmap phases are complete. The package is fully adopted in the Serenity trainer for:
+All roadmap phases are complete. The package is fully adopted in the Serenity trainer and serves as the universal model loading layer for SerenityFlow.
 
+Current uses:
 - O_DIRECT checkpoint saves (saver.py, trainer.py)
 - source manifest resolution (Stagehand source resolver)
 - persisted EriQuant frozen base reuse (eriquant_stagehand.py)
+- universal model loading for SerenityFlow (safetensors, GGUF, PyTorch, diffusers)
 
 ## How the loading works
 

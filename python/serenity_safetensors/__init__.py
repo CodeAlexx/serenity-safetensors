@@ -50,6 +50,15 @@ from .serenity_safetensors import (
     shard_index,
     sharded_tensor_names,
     sharded_tensor_layout,
+    detect_format,
+    probe_model,
+    probe_diffusers,
+    load_pickle_index,
+    load_pickle_tensor,
+    load_gguf_index,
+    dequant_tensor,
+    load_model as _load_model_raw,
+    QuantizedTensor,
 )
 
 
@@ -136,6 +145,95 @@ def load_quantized_blocks(reference_path, block_ids=None, device="cpu"):
     return SafeTensorsDict(tensor_dict, mmap_handles)
 
 
+class ModelData:
+    """Result from load_model(). Dict-like access to tensors with metadata.
+
+    Tensors may be torch.Tensor (dense) or QuantizedTensor (GGUF quantized).
+    The mmap handles are kept alive internally to support zero-copy tensor views.
+    """
+
+    __slots__ = ("_tensors", "_info", "_mmap_handles")
+
+    def __init__(self, tensors, info, mmap_handles=None):
+        self._tensors = tensors
+        self._info = info
+        self._mmap_handles = mmap_handles
+
+    @property
+    def tensors(self):
+        """Dict mapping tensor names to torch.Tensor or QuantizedTensor."""
+        return self._tensors
+
+    @property
+    def info(self):
+        """Dict with format metadata (format, path, etc.)."""
+        return self._info
+
+    @property
+    def format(self):
+        """Model format string: 'safetensors', 'gguf', 'pytorch_zip', 'diffusers'."""
+        return self._info.get("format", "unknown")
+
+    def __getitem__(self, key):
+        return self._tensors[key]
+
+    def __contains__(self, key):
+        return key in self._tensors
+
+    def __len__(self):
+        return len(self._tensors)
+
+    def __iter__(self):
+        return iter(self._tensors)
+
+    def keys(self):
+        return self._tensors.keys()
+
+    def values(self):
+        return self._tensors.values()
+
+    def items(self):
+        return self._tensors.items()
+
+    def get(self, key, default=None):
+        return self._tensors.get(key, default)
+
+    def close(self):
+        """Explicitly close backing mmaps. Tensors become invalid after this."""
+        if self._mmap_handles is None:
+            return
+        for handle in self._mmap_handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._mmap_handles = None
+
+    def __repr__(self):
+        return (
+            f"ModelData(format='{self.format}', "
+            f"tensors={len(self._tensors)}, "
+            f"path='{self._info.get('path', '')}')"
+        )
+
+
+def load_model(path, strip_prefix=None):
+    """Load model from any supported format (safetensors, GGUF, PyTorch, diffusers).
+
+    Returns a ModelData object with dict-like access to tensors.
+    Dense tensors are torch.Tensor; GGUF quantized tensors are QuantizedTensor.
+
+    Args:
+        path: File or directory path.
+        strip_prefix: Optional prefix to strip from tensor names (e.g. "model.").
+
+    Returns:
+        ModelData with .tensors, .info, .format, and dict-like access.
+    """
+    tensors, info, mmap_handles = _load_model_raw(path, strip_prefix)
+    return ModelData(tensors, info, mmap_handles)
+
+
 from . import torch
 
 __all__ = [
@@ -168,6 +266,16 @@ __all__ = [
     "shard_index",
     "sharded_tensor_names",
     "sharded_tensor_layout",
+    "detect_format",
+    "probe_model",
+    "probe_diffusers",
+    "load_pickle_index",
+    "load_pickle_tensor",
+    "load_gguf_index",
+    "dequant_tensor",
+    "QuantizedTensor",
     "SafeTensorsDict",
+    "ModelData",
+    "load_model",
     "torch",
 ]
