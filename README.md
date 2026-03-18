@@ -70,6 +70,39 @@ fmt = detect_format("model.safetensors")  # "safetensors"
 
 Full dequant support for: F16, F32, BF16, F64, I8, I16, I32, I64, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K. IQ types (IQ2_XXS, IQ3_S, etc.) are preserved as QuantizedTensor but dequant is not yet implemented.
 
+## Quantized checkpoint normalization
+
+Detects and normalizes three quantized checkpoint formats to a single canonical form. Downstream consumers (EriQuant, inference engines) get a uniform dict regardless of how the checkpoint was saved.
+
+```python
+from serenity_safetensors.quant_compat import (
+    detect_quant_format,
+    normalize_quant_checkpoint,
+    is_quantized_checkpoint,
+)
+
+# Works with any supported format — caller doesn't need to know which
+fmt = detect_quant_format(state_dict, prefix="model.")
+# Returns: "scaled_fp8_v1", "comfy_quant_v2", "metadata_v3", or None
+
+normalized = normalize_quant_checkpoint(state_dict, prefix="model.")
+# Canonical output per quantized layer:
+#   {layer}.weight       — original storage tensor (unchanged)
+#   {layer}.weight_scale — float32 scale (renamed from scale_weight if needed)
+#   {layer}.input_scale  — float32 (only if != 1.0)
+#   {layer}.quant_meta   — JSON string: {"format": "...", "full_precision": bool}
+```
+
+### Supported formats
+
+| Format | Detection | Source |
+|--------|-----------|--------|
+| **LTX 2.3 FP8** (`scaled_fp8_v1`) | `{prefix}scaled_fp8` marker key | Lightricks scaled FP8 checkpoints |
+| **ComfyUI new** (`comfy_quant_v2`) | `{prefix}*.comfy_quant` keys | ComfyUI quantized saves (FP8, MXFP8, NVFP4) |
+| **Safetensors metadata** (`metadata_v3`) | `_quantization_metadata` in file metadata | Any tool that writes quant info to safetensors header |
+
+Pure key/metadata manipulation — no tensor math, no external dependencies.
+
 ## What's different from `safetensors.torch`
 
 | Issue with `safetensors.torch` | serenity-safetensors |
@@ -341,6 +374,10 @@ print(layout["tensors"]["transformer.blocks.0.attn.qkv.weight"]["path"])
 | `sharded_tensor_names(index_path)` | List all tensor names referenced by a sharded index |
 | `sharded_tensor_layout(index_path)` | Resolve shard paths and tensor byte offsets across a sharded index |
 | `training_metadata(step, lr, loss, epoch, extra)` | Build metadata dict for checkpoint saves |
+| **Quantized checkpoint normalization** | |
+| `detect_quant_format(state_dict, prefix, metadata)` | Detect format → `"scaled_fp8_v1"`, `"comfy_quant_v2"`, `"metadata_v3"`, or `None` |
+| `normalize_quant_checkpoint(state_dict, prefix, metadata)` | Normalize any format to canonical form (new dict, no mutation) |
+| `is_quantized_checkpoint(state_dict, prefix, metadata)` | Quick boolean check for any supported format |
 | **Universal loading** | |
 | `load_model(path, strip_prefix=None)` | Load any format — returns `ModelData` with tensors + info |
 | `probe_model(path)` | Header-only probe — format, tensor count, shapes, dtypes (~1ms) |
