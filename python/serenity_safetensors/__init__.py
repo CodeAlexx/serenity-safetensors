@@ -235,6 +235,11 @@ def load_model(path, strip_prefix=None):
 
 
 from . import torch
+from .quant_compat import (
+    detect_quant_format,
+    normalize_quant_checkpoint,
+    is_quantized_checkpoint,
+)
 
 __all__ = [
     "save_file_direct",
@@ -278,4 +283,8 @@ __all__ = [
     "ModelData",
     "load_model",
     "torch",
+    "detect_quant_format",
+    "normalize_quant_checkpoint",
+    "is_quantized_checkpoint",
+    "quant_compat",
 ]
