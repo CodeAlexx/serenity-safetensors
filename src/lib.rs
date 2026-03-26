@@ -2,6 +2,8 @@ pub mod diffusers;
 pub mod format_detect;
 pub mod gguf;
 pub mod gguf_dequant;
+#[cfg(target_os = "linux")]
+pub mod mmap;
 pub mod probe;
 pub mod pytorch;
 pub mod quantized_tensor;
@@ -3456,6 +3458,8 @@ fn serenity_safetensors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dequant_tensor, m)?)?;
     m.add_function(wrap_pyfunction!(unified::load_model, m)?)?;
     m.add_class::<quantized_tensor::QuantizedTensor>()?;
+    #[cfg(target_os = "linux")]
+    m.add_class::<mmap::PyMmapFile>()?;
     Ok(())
 }
 

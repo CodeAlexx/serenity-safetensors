@@ -61,6 +61,12 @@ from .serenity_safetensors import (
     QuantizedTensor,
 )
 
+# Uncommitted mmap (Linux only — graceful no-op on other platforms)
+try:
+    from .serenity_safetensors import MmapFile
+except ImportError:
+    MmapFile = None
+
 
 class SafeTensorsDict(dict):
     """Dict subclass that keeps the mmap handle alive.
