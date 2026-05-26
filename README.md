@@ -4,6 +4,15 @@ Universal model loading for Serenity. Rust core, PyO3 bindings.
 
 Loads safetensors, GGUF (quantized), PyTorch checkpoints (.pt/.pth/.bin), and diffusers directories through a single `load_model(path)` call. GGUF quantized tensors stay compact in memory and dequantize to BF16 on demand during Stagehand H2D transfer.
 
+## Implementations
+
+| Language | Path | Scope |
+|---|---|---|
+| **Rust** (core) + **Python** (PyO3) | [`src/`](src/), [`python/`](python/) | Full: read + write, GGUF dequant, PyTorch pickle, diffusers, manifests, O_DIRECT saves. |
+| **Mojo** | [`mojo/`](mojo/) | Read path — lazy-mmap single-file + sharded safetensors, header-only inspection, lifetime-safe tensor views. |
+
+**Mojo coders:** see [`mojo/README.md`](mojo/README.md). The Mojo package is a pure-Mojo (no Python in the runtime path) port of the Rust reader for zero-copy, low-RAM model loading directly from Mojo — `from serenity_safetensors.safetensors import SafeTensors`. Read-only today; writing/GGUF/pickle live in the Rust + Python sides above.
+
 ## Benchmarks
 
 Tested on Gemma 3 12B shard (500 tensors, ~5GB):
